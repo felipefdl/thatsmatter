@@ -26,24 +26,16 @@ pub fn on_off_command(export_id: Uuid, on: bool) -> CommandRequest {
 
 /// Resolve the on/off value for an export from a batch of HA state values.
 ///
-/// Prefers the primary entity id; falls back to the first parsable on/off state.
+/// Only the primary entity may drive OnOff: linked-entity states (battery,
+/// brightness, position) parse as "1"/"0" and must not flip the device.
 pub fn on_off_from_states(export: &Export, states: &[HaStateValue]) -> Option<bool> {
   if !export.type_.is_on_off_capable() {
     return None;
   }
-  for st in states {
-    if st.entity_id == export.primary_entity_id
-      && let Some(on) = ha_state_is_on(&st.state)
-    {
-      return Some(on);
-    }
-  }
-  for st in states {
-    if let Some(on) = ha_state_is_on(&st.state) {
-      return Some(on);
-    }
-  }
-  None
+  states
+    .iter()
+    .find(|st| st.entity_id == export.primary_entity_id)
+    .and_then(|st| ha_state_is_on(&st.state))
 }
 
 /// Whether this export should be published as a Matter OnOff endpoint.
@@ -129,6 +121,25 @@ mod tests {
       },
     ];
     assert_eq!(on_off_from_states(&e, &states), Some(true));
+  }
+
+  #[test]
+  fn linked_states_never_drive_on_off() {
+    let id = Uuid::new_v4();
+    let e = exp(id, "light.a", DeviceType::Light, true, Some(1));
+    let states = [
+      HaStateValue {
+        entity_id: "light.a".into(),
+        state: "unavailable".into(),
+        attributes: Default::default(),
+      },
+      HaStateValue {
+        entity_id: "sensor.battery".into(),
+        state: "0".into(),
+        attributes: Default::default(),
+      },
+    ];
+    assert_eq!(on_off_from_states(&e, &states), None);
   }
 
   #[test]
