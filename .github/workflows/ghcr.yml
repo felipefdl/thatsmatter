@@ -1,5 +1,8 @@
 name: GHCR
 
+# Native multi-arch: ubuntu-24.04 (amd64) + ubuntu-24.04-arm (arm64).
+# No QEMU cross-compile.
+
 on:
   push:
     branches: [main]
@@ -11,33 +14,29 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/felipefdl/thatsmatter
+  REGISTRY_IMAGE: ghcr.io/felipefdl/thatsmatter
 
 jobs:
-  build-push:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Image metadata
-        id: meta
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          else
-            SHA_SHORT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
-            echo "version=0.0.0-dev.${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-            echo "tags=${IMAGE}:main,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -47,17 +46,84 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Version string
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev.$(echo "${GITHUB_SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: addons/thatsmatter/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            BUILD_VERSION=${{ steps.meta.outputs.version }}
-          tags: ${{ steps.meta.outputs.tags }}
+            BUILD_VERSION=${{ steps.ver.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/felipefdl/thatsmatter
             org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch tags
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG_ARGS=(-t "${REGISTRY_IMAGE}:${VERSION}" -t "${REGISTRY_IMAGE}:latest")
+            INSPECT="${REGISTRY_IMAGE}:latest"
+          else
+            SHA_SHORT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+            TAG_ARGS=(-t "${REGISTRY_IMAGE}:main" -t "${REGISTRY_IMAGE}:sha-${SHA_SHORT}")
+            INSPECT="${REGISTRY_IMAGE}:main"
+          fi
+          SOURCES=()
+          for digest_file in *; do
+            SOURCES+=("${REGISTRY_IMAGE}@sha256:${digest_file}")
+          done
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+          docker buildx imagetools inspect "${INSPECT}"
