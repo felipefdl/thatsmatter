@@ -154,8 +154,6 @@ class ThatsMatterRuntime:
         if self._unsub_state is not None:
             self._unsub_state()
             self._unsub_state = None
-        for unsub in self._listeners:
-            unsub()
         self._listeners.clear()
         for task in (self._command_task, self._status_task):
             if task is not None and not task.done():
@@ -318,7 +316,10 @@ class ThatsMatterRuntime:
         try:
             if kind == "on_off":
                 on = bool(cmd.get("on", True))
-                service = SERVICE_TURN_ON if on else SERVICE_TURN_OFF
+                if domain == "cover":
+                    service = SERVICE_OPEN_COVER if on else SERVICE_CLOSE_COVER
+                else:
+                    service = SERVICE_TURN_ON if on else SERVICE_TURN_OFF
                 await self.hass.services.async_call(
                     domain, service, data, blocking=True
                 )
