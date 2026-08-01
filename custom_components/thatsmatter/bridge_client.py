@@ -101,6 +101,20 @@ class BridgeClient:
         result = await self._request("GET", "/pairing")
         return result if isinstance(result, dict) else {}
 
+    async def open_pairing(self, timeout_secs: int = 300) -> dict[str, Any]:
+        """POST /pairing/open with optional timeout (bridge clamps 180..=900)."""
+        result = await self._request(
+            "POST",
+            "/pairing/open",
+            json_body={"timeout_secs": int(timeout_secs)},
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def close_pairing(self) -> dict[str, Any]:
+        """POST /pairing/close."""
+        result = await self._request("POST", "/pairing/close")
+        return result if isinstance(result, dict) else {}
+
     async def list_exports(self) -> list[dict[str, Any]]:
         """GET /exports."""
         result = await self._request("GET", "/exports")

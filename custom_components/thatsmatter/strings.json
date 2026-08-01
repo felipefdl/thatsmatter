@@ -43,7 +43,7 @@
       },
       "pairing": {
         "title": "Pair with other apps",
-        "description": "### Setup code\n\n# `{setup_code}`\n\n1. Open **Alexa**, **Google Home**, **SmartThings**, or **Apple Home**\n2. **Add device** → **Matter** (not a cloud skill)\n3. Enter the setup code above, or scan the **Pairing QR code** image on the ThatsMatter device page in Home Assistant\n\nQR payload: `{qr_payload}`\n\nA notification with this code is also shown in Home Assistant.\n\nNothing is shared until you use **Add devices to export**."
+        "description": "### Setup code\n\n# `{setup_code}`\n\nThis step opens the pairing window for several minutes so other apps can join.\n\n1. Open **Alexa**, **Google Home**, **SmartThings**, or **Apple Home**\n2. **Add device** → **Matter** (not a cloud skill)\n3. Enter the setup code above, or scan the **Pairing QR code** image on the ThatsMatter device page in Home Assistant\n\nIf the window closed, press **Open pairing window** on the ThatsMatter device, or open this step again. Apps that already paired can also share the bridge via Home Assistant's Matter **share device** flow.\n\nQR payload: `{qr_payload}`\n\nA notification with this code is also shown in Home Assistant while the window is open.\n\nNothing is shared until you use **Add devices to export**."
       },
       "add_export": {
         "title": "Add devices to export",
@@ -116,6 +116,11 @@
     "image": {
       "pairing_qr": {
         "name": "Pairing QR code"
+      }
+    },
+    "button": {
+      "open_pairing": {
+        "name": "Open pairing window"
       }
     }
   },

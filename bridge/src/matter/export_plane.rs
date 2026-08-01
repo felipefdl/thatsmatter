@@ -18,6 +18,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use rs_matter::dm::clusters::decl::bridged_device_basic_information as bridged_info;
@@ -38,6 +39,7 @@ use rs_matter_stack::eth::EthMatterStack;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use super::backend::{STARTUP_PAIRING_TIMEOUT_SECS, clamp_pairing_timeout, epoch_secs};
 use super::clusters::boolean_state::{self as bool_state_cluster};
 use super::clusters::occupancy::{self as occupancy_cluster};
 use super::clusters::window_covering::{
@@ -52,6 +54,20 @@ use crate::catalog::{CommandKind, CommandRequest, DeviceType, Export, HaStateVal
 
 /// Matter endpoint hosting the aggregator (root is 0, bridged devices start at 2).
 pub const AGGREGATOR_ENDPOINT_ID: EndptId = 1;
+
+/// How often the stack thread re-samples fabric count when idle.
+const FABRIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cross-thread request to open or close the basic commissioning window.
+enum WindowOp {
+  Open(u16),
+  Close,
+}
+
+struct WindowRequest {
+  op: WindowOp,
+  reply: std::sync::mpsc::Sender<Result<(), String>>,
+}
 
 /// Matter caps `NodeLabel` at 32 octets.
 const NODE_LABEL_MAX_BYTES: usize = 32;
@@ -415,7 +431,8 @@ impl PlaneState {
 /// Slot table plus the wake-up plumbing shared with the Matter stack thread.
 pub struct ExportPlane {
   state: RwLock<Arc<PlaneState>>,
-  /// Wakes `run()`: emit subscription reports, bump the configuration version.
+  /// Wakes `run()`: emit subscription reports, bump the configuration version,
+  /// or process a pairing-window request.
   changed: Notify,
   commands: Mutex<VecDeque<CommandRequest>>,
   /// Generation of the latest surface that still owes a `ConfigurationVersion` bump.
@@ -427,6 +444,13 @@ pub struct ExportPlane {
   /// clear a newer request (the AtomicBool load/store race).
   config_applied: AtomicU64,
   aggregator_dataver: AtomicU32,
+  /// Epoch seconds when the basic pairing window closes; 0 = closed.
+  /// Tracked by us: rs-matter does not expose a read-only window probe.
+  window_deadline: AtomicU64,
+  /// Last sampled commissioned fabric count (`with_state` on the stack thread).
+  fabric_count: AtomicU8,
+  /// Pending open/close from the IPC plane; drained only on the stack thread.
+  window_request: Mutex<Option<WindowRequest>>,
 }
 
 impl Default for ExportPlane {
@@ -444,6 +468,72 @@ impl ExportPlane {
       config_requested: AtomicU64::new(0),
       config_applied: AtomicU64::new(0),
       aggregator_dataver: AtomicU32::new(rand::random()),
+      window_deadline: AtomicU64::new(0),
+      fabric_count: AtomicU8::new(0),
+      window_request: Mutex::new(None),
+    }
+  }
+
+  /// Whether the basic commissioning window is currently open (deadline-based).
+  pub fn pairing_open(&self) -> bool {
+    let deadline = self.window_deadline.load(Ordering::SeqCst);
+    deadline != 0 && epoch_secs() < deadline
+  }
+
+  /// Last fabric count sampled on the Matter stack thread.
+  pub fn commissioned_fabrics(&self) -> u8 {
+    self.fabric_count.load(Ordering::SeqCst)
+  }
+
+  /// Seed window + fabric state after stack `startup` (must run on the stack thread
+  /// context that already opened a 900s window when fabric count is zero).
+  pub fn note_startup_commissioning_state(&self, fabric_count: u8) {
+    self.fabric_count.store(fabric_count, Ordering::SeqCst);
+    if fabric_count == 0 {
+      let deadline = epoch_secs().saturating_add(STARTUP_PAIRING_TIMEOUT_SECS);
+      self.window_deadline.store(deadline, Ordering::SeqCst);
+      tracing::info!(
+        timeout_secs = STARTUP_PAIRING_TIMEOUT_SECS,
+        "pairing window open at startup (no fabrics)"
+      );
+    } else {
+      self.window_deadline.store(0, Ordering::SeqCst);
+    }
+  }
+
+  /// Ask the stack thread to open a basic commissioning window.
+  pub fn request_open_window(&self, timeout_secs: u16) -> anyhow::Result<()> {
+    let timeout = clamp_pairing_timeout(timeout_secs);
+    self.post_window_request(WindowOp::Open(timeout))
+  }
+
+  /// Ask the stack thread to close any open commissioning window.
+  pub fn request_close_window(&self) -> anyhow::Result<()> {
+    self.post_window_request(WindowOp::Close)
+  }
+
+  fn post_window_request(&self, op: WindowOp) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+      let mut slot = self.window_request.lock();
+      if slot.is_some() {
+        anyhow::bail!("pairing window request already in flight");
+      }
+      *slot = Some(WindowRequest { op, reply: tx });
+    }
+    self.changed.notify_one();
+    match rx.recv_timeout(Duration::from_secs(10)) {
+      Ok(Ok(())) => Ok(()),
+      Ok(Err(msg)) => anyhow::bail!(msg),
+      Err(_) => {
+        // Stack never drained the request (died or never entered run). Clear so
+        // a later open/close is not stuck behind a dead mailbox entry.
+        let mut slot = self.window_request.lock();
+        if slot.is_some() {
+          *slot = None;
+        }
+        anyhow::bail!("pairing window request timed out waiting for the Matter stack")
+      }
     }
   }
 
@@ -1023,7 +1113,20 @@ impl AsyncHandler for ExportPlane {
   /// stack thread, which is the only place `Matter` may be touched.
   async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
     loop {
-      self.changed.notified().await;
+      // Wake on export changes / window requests, or periodically to sample fabrics
+      // and expire the pairing-window deadline.
+      {
+        let wake = async {
+          self.changed.notified().await;
+        };
+        let tick = async {
+          async_io::Timer::after(FABRIC_SAMPLE_INTERVAL).await;
+        };
+        futures_lite::future::race(wake, tick).await;
+      }
+
+      self.drain_window_request(&ctx);
+      self.sample_fabrics(&ctx);
 
       // Drain every outstanding config generation. Acknowledge only the generation
       // observed before the bump: if `set_exports` advanced the counter while we
@@ -1061,6 +1164,65 @@ impl AsyncHandler for ExportPlane {
       for (endpoint, cluster, attr) in self.drain_reports() {
         ctx.notify_attr_changed(endpoint, cluster, attr);
       }
+    }
+  }
+}
+
+impl ExportPlane {
+  /// Process one pending open/close (if any). Must run on the Matter stack thread.
+  fn drain_window_request(&self, ctx: &impl HandlerContext) {
+    let Some(req) = self.window_request.lock().take() else {
+      return;
+    };
+    let result = match req.op {
+      WindowOp::Open(timeout_secs) => {
+        // rs-matter rejects open while a window is already open. Close first so
+        // "Open pairing window" is idempotent for multi-admin re-pair.
+        let _ = ctx.matter().close_comm_window(ctx);
+        match ctx.matter().open_basic_comm_window(timeout_secs, ctx.crypto(), ctx) {
+          Ok(()) => {
+            let deadline = epoch_secs().saturating_add(u64::from(timeout_secs));
+            self.window_deadline.store(deadline, Ordering::SeqCst);
+            tracing::info!(timeout_secs, "basic commissioning window opened");
+            Ok(())
+          }
+          Err(err) => {
+            tracing::warn!(error = ?err, "open_basic_comm_window failed");
+            Err(format!("open pairing window failed: {err:?}"))
+          }
+        }
+      }
+      WindowOp::Close => match ctx.matter().close_comm_window(ctx) {
+        Ok(was_open) => {
+          self.window_deadline.store(0, Ordering::SeqCst);
+          tracing::info!(was_open, "commissioning window closed");
+          Ok(())
+        }
+        Err(err) => {
+          tracing::warn!(error = ?err, "close_comm_window failed");
+          Err(format!("close pairing window failed: {err:?}"))
+        }
+      },
+    };
+    let _ = req.reply.send(result);
+  }
+
+  /// Snapshot fabric count; clear our window when a new fabric appears.
+  fn sample_fabrics(&self, ctx: &impl HandlerContext) {
+    let count = ctx.matter().with_state(|state| state.fabrics.iter().count());
+    let count = u8::try_from(count).unwrap_or(u8::MAX);
+    let prev = self.fabric_count.swap(count, Ordering::SeqCst);
+    if count > prev {
+      // Commissioning completed (or another fabric was added): window is done.
+      self.window_deadline.store(0, Ordering::SeqCst);
+      tracing::info!(fabrics = count, "fabric count increased; pairing window closed");
+    }
+    // Lazy expiry: pairing_open() already compares now < deadline, but clear the
+    // atomic so status stays honest without a clock on every poll.
+    let deadline = self.window_deadline.load(Ordering::SeqCst);
+    if deadline != 0 && epoch_secs() >= deadline {
+      self.window_deadline.store(0, Ordering::SeqCst);
+      tracing::info!("pairing window expired");
     }
   }
 }

@@ -104,4 +104,6 @@ class ThatsMatterPairingQrImage(ImageEntity):
 
     @property
     def available(self) -> bool:
-        return bool(self._runtime.pairing.get("qr_payload"))
+        return self._runtime.pairing_window_open and bool(
+            self._runtime.pairing.get("qr_payload")
+        )

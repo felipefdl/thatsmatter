@@ -125,8 +125,26 @@ class ThatsMatterRuntime:
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("ThatsMatter listener failed")
 
+    @property
+    def pairing_window_open(self) -> bool:
+        """Whether the bridge reports an open basic commissioning window."""
+        return bool(self.bridge_status.get("pairing_open"))
+
+    async def async_open_pairing_window(self, timeout_secs: int = 300) -> None:
+        """Open the pairing window, refresh status/material, notify listeners."""
+        client = self._require_client()
+        await client.open_pairing(timeout_secs)
+        await self.async_refresh_status()
+        await self.async_refresh_pairing()
+        await self.async_show_pairing_notification()
+        self.notify_listeners()
+
     async def async_show_pairing_notification(self) -> None:
-        """Surface pairing code in the HA notification drawer (no YAML / host shell)."""
+        """Surface pairing code in the HA notification drawer while the window is open."""
+        if not self.pairing_window_open:
+            # Allow a later re-open of the same code to notify again.
+            self._last_notified_code = None
+            return
         code = self.pairing.get("setup_code")
         if not code:
             return
@@ -141,6 +159,9 @@ class ThatsMatterRuntime:
             f"**Add device → Matter**, then enter this code (or open "
             f"**Settings → Devices & services → ThatsMatter → Configure → Pair with other apps** "
             f"to see the QR code).\n\n"
+            f"The pairing window stays open for a few minutes. Press **Open pairing window** "
+            f"on the ThatsMatter device if it closed. Already-paired apps can also share the "
+            f"bridge via Home Assistant's Matter **share device** flow.\n\n"
             f"Nothing is shared until you add devices under **Configure → Add devices**."
         )
         from homeassistant.components.persistent_notification import (

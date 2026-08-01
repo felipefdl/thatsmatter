@@ -2555,6 +2555,7 @@ name = "thatsmatter-bridge"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-io",
  "async-trait",
  "axum",
  "clap",

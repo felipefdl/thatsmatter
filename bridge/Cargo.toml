@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+async-io = "2"
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

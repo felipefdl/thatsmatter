@@ -10,7 +10,10 @@ mod on_off_map;
 pub(crate) mod pairing;
 mod rs_matter_backend;
 
-pub use backend::MatterBackend;
+pub use backend::{
+  MatterBackend, PAIRING_TIMEOUT_DEFAULT_SECS, PAIRING_TIMEOUT_MAX_SECS, PAIRING_TIMEOUT_MIN_SECS,
+  clamp_pairing_timeout,
+};
 pub use commissioning::CommissioningMaterial;
 pub use dev::DevMatterBackend;
 pub use on_off_map::{

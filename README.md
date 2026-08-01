@@ -32,8 +32,9 @@ Download **ThatsMatter** → restart Home Assistant → **Settings → Devices &
 ### 3. Use
 
 1. **ThatsMatter → Configure → Add devices to export** (entity picker)
-2. **Configure → Pair with other apps** (setup code; QR on the device page)
+2. **Configure → Pair with other apps** (opens the pairing window and shows the setup code; QR on the device page)
 3. In Alexa / Google / Apple / SmartThings: **Add device → Matter**
+4. For another ecosystem after the first commission: press **Open pairing window** on the ThatsMatter device (or open **Pair with other apps** again), then pair within the window. Apps that already paired can also share the bridge via Home Assistant's Matter **share device** flow.
 
 Full guide: [docs/haos-install.md](docs/haos-install.md)
 

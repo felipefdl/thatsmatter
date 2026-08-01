@@ -207,7 +207,7 @@ class ThatsMatterOptionsFlow(config_entries.OptionsFlow):
     async def async_step_pairing(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Show Matter setup code and where to find the QR (no host shell)."""
+        """Open the pairing window, then show setup code and QR guidance."""
         if user_input is not None:
             return await self.async_step_init()
 
@@ -215,10 +215,14 @@ class ThatsMatterOptionsFlow(config_entries.OptionsFlow):
         qr = "—"
         try:
             runtime = get_runtime(self.hass)
-            await runtime.async_refresh_pairing()
+            # Ensure the shown code is usable for multi-admin pairing.
+            try:
+                await runtime.async_open_pairing_window()
+            except BridgeClientError:
+                # Bridge offline or open failed; still try last-known material.
+                await runtime.async_refresh_pairing()
             code = str(runtime.pairing.get("setup_code") or "—")
             qr = str(runtime.pairing.get("qr_payload") or "—")
-            await runtime.async_show_pairing_notification()
         except HomeAssistantError:
             pass
 

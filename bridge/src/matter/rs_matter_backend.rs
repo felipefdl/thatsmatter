@@ -5,6 +5,11 @@
 //! endpoint at catalog `endpoint_id` + 1. Controllers (HA Matter Server,
 //! chip-tool, Alexa, …) commission using this install's pairing material and
 //! receive subscription reports as HA state changes.
+//!
+//! Pairing-window truth lives on [`ExportPlane`]: rs-matter opens a 900s basic
+//! window at startup only when no fabrics exist, and does not expose a
+//! read-only probe. Open/close from IPC is executed on the stack thread via a
+//! request mailbox in the plane `run()` loop.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +20,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use super::backend::MatterBackend;
+use super::backend::{MatterBackend, clamp_pairing_timeout};
 use super::commissioning::CommissioningMaterial;
 use super::export_plane::{BridgedEndpointMatcher, ExportPlane};
 use super::pairing::{basic_comm_data, pairing_material_for};
@@ -28,7 +33,6 @@ pub struct RsMatterBackend {
   /// Bridged endpoint table, shared with the Matter stack thread.
   plane: Arc<ExportPlane>,
   running: AtomicBool,
-  pairing_open: AtomicBool,
   error: Mutex<Option<String>>,
   /// Matter stack thread (keeps process advertising while join handle is alive).
   _stack_thread: Mutex<Option<JoinHandle<()>>>,
@@ -44,7 +48,6 @@ impl RsMatterBackend {
       data_dir,
       plane: Arc::new(ExportPlane::new()),
       running: AtomicBool::new(false),
-      pairing_open: AtomicBool::new(false),
       error: Mutex::new(None),
       _stack_thread: Mutex::new(None),
       pairing: pairing_material_for(&commissioning),
@@ -128,6 +131,12 @@ fn run_matter_stack(
     let mut store = DirKvBlobStore::new(store_path);
     futures_lite::future::block_on(stack.startup(&crypto, &mut store)).map_err(|e| format!("startup: {e:?}"))?;
 
+    // Stack opens a 900s basic window when fabric count is 0; mirror that into
+    // our deadline so `/status.pairing_open` is truthful from first poll.
+    let fabric_count = stack.matter().with_state(|state| state.fabrics.iter().count());
+    let fabric_count = u8::try_from(fabric_count).unwrap_or(u8::MAX);
+    plane.note_startup_commissioning_state(fabric_count);
+
     let kv = stack.matter().kv(store);
 
     let _ = stack
@@ -168,10 +177,11 @@ impl MatterBackend for RsMatterBackend {
     std::fs::create_dir_all(&self.data_dir)?;
     self.spawn_stack()?;
     self.running.store(true, Ordering::SeqCst);
-    self.pairing_open.store(true, Ordering::SeqCst);
     tracing::info!(
       data_dir = %self.data_dir.display(),
       setup_code = %self.pairing.setup_code,
+      pairing_open = self.plane.pairing_open(),
+      fabrics = self.plane.commissioned_fabrics(),
       "RsMatterBackend started (commissionable IP bridge)"
     );
     Ok(())
@@ -182,7 +192,26 @@ impl MatterBackend for RsMatterBackend {
   }
 
   async fn pairing_open(&self) -> bool {
-    self.pairing_open.load(Ordering::SeqCst)
+    self.plane.pairing_open()
+  }
+
+  async fn open_pairing_window(&self, timeout_secs: u16) -> anyhow::Result<()> {
+    if !self.running.load(Ordering::SeqCst) {
+      anyhow::bail!("Matter stack is not running");
+    }
+    let timeout = clamp_pairing_timeout(timeout_secs);
+    self.plane.request_open_window(timeout)
+  }
+
+  async fn close_pairing_window(&self) -> anyhow::Result<()> {
+    if !self.running.load(Ordering::SeqCst) {
+      anyhow::bail!("Matter stack is not running");
+    }
+    self.plane.request_close_window()
+  }
+
+  async fn commissioned_fabrics(&self) -> u8 {
+    self.plane.commissioned_fabrics()
   }
 
   async fn set_exports(&self, exports: &[Export]) -> anyhow::Result<()> {

@@ -26,7 +26,12 @@ def _platforms() -> list[Any]:
     """Entity platforms this integration sets up (import deferred for tests)."""
     from homeassistant.const import Platform
 
-    return [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE]
+    return [
+        Platform.SENSOR,
+        Platform.BINARY_SENSOR,
+        Platform.IMAGE,
+        Platform.BUTTON,
+    ]
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:

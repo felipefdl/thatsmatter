@@ -117,7 +117,10 @@ assert d["bridge_name"] == "SmokeBridge"
 assert d["running"] is True
 assert d["matter_backend"] == "dev"
 assert d["export_count"] == 0
-print("    bridge_name=", d["bridge_name"], "backend=", d["matter_backend"])
+assert d["pairing_open"] is True
+assert d["commissioned_fabrics"] == 0
+print("    bridge_name=", d["bridge_name"], "backend=", d["matter_backend"],
+      "pairing_open=", d["pairing_open"], "fabrics=", d["commissioned_fabrics"])
 '
 
 echo "==> GET /pairing"
@@ -129,6 +132,47 @@ assert d["setup_code"]
 assert d["qr_payload"]
 assert "discriminator" in d and "passcode" in d
 print("    setup_code=", d["setup_code"][:20] + "...")
+'
+
+echo "==> POST /pairing/close"
+CLOSE="$(curl -sf -X POST "${BASE}/pairing/close")"
+echo "${CLOSE}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["pairing_open"] is False
+print("    pairing_open=False")
+'
+curl -sf "${BASE}/status" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["pairing_open"] is False
+print("    status.pairing_open=False")
+'
+
+echo "==> POST /pairing/open (empty body -> default 300)"
+OPEN="$(curl -sf -X POST "${BASE}/pairing/open" -H "content-type: application/json" -d "")"
+echo "${OPEN}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["pairing_open"] is True
+assert d["timeout_secs"] == 300
+print("    timeout_secs=", d["timeout_secs"])
+'
+
+echo "==> POST /pairing/open (timeout_secs=60 clamps to 180)"
+OPEN60="$(curl -sf -X POST "${BASE}/pairing/open" -H "content-type: application/json" -d "{\"timeout_secs\":60}")"
+echo "${OPEN60}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["pairing_open"] is True
+assert d["timeout_secs"] == 180
+print("    clamped timeout_secs=", d["timeout_secs"])
+'
+curl -sf "${BASE}/status" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["pairing_open"] is True
+print("    status.pairing_open=True after open")
 '
 
 EXPORT_ID="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"

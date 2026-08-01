@@ -97,6 +97,7 @@ class ThatsMatterStatusSensor(ThatsMatterBaseSensor):
             "export_count": status.get("export_count"),
             "enabled_export_count": status.get("enabled_export_count"),
             "pairing_open": status.get("pairing_open"),
+            "commissioned_fabrics": status.get("commissioned_fabrics"),
             "error": status.get("error") or self._runtime.last_error,
             "local_export_count": len(self._runtime.store.list_exports()),
         }
@@ -117,6 +118,9 @@ class ThatsMatterPairingCodeSensor(ThatsMatterBaseSensor):
 
     @property
     def native_value(self) -> str | None:
+        # Only surface the code while the commissioning window is open.
+        if not self._runtime.pairing_window_open:
+            return None
         code = self._runtime.pairing.get("setup_code")
         return str(code) if code else None
 
@@ -124,10 +128,15 @@ class ThatsMatterPairingCodeSensor(ThatsMatterBaseSensor):
     def extra_state_attributes(self) -> dict:
         pairing = self._runtime.pairing
         return {
-            "qr_payload": pairing.get("qr_payload"),
+            "qr_payload": pairing.get("qr_payload")
+            if self._runtime.pairing_window_open
+            else None,
             "discriminator": pairing.get("discriminator"),
             # passcode is sensitive; omit from attributes in production UIs if needed.
-            "passcode": pairing.get("passcode"),
+            "passcode": pairing.get("passcode")
+            if self._runtime.pairing_window_open
+            else None,
+            "pairing_window_open": self._runtime.pairing_window_open,
         }
 
 
