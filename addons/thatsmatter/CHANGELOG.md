@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Fix App crash on HAOS: build the bridge on Debian bookworm so glibc matches the runtime image (GLIBC_2.39 not found)
+
 ## 0.2.1
 
 - Select a real LAN interface with IPv6 for Matter (skip Docker/hassio virtual faces)

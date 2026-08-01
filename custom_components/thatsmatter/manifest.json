@@ -9,6 +9,6 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/felipefdl/thatsmatter/issues",
   "requirements": ["segno==1.6.6"],
-  "version": "0.2.1"
+  "version": "0.2.2"
 }
 

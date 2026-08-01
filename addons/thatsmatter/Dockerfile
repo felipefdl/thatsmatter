@@ -4,7 +4,10 @@
 
 ARG BUILD_FROM=ghcr.io/home-assistant/base-debian:bookworm
 
-FROM rust:latest AS builder
+# Build on Debian bookworm so the binary links against GLIBC ≤ bookworm's
+# (HAOS App runtime). rust:latest is newer (GLIBC 2.39+) and crashes at start:
+#   version `GLIBC_2.39' not found (required by /usr/bin/thatsmatter-bridge)
+FROM rust:1-bookworm AS builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
