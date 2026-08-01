@@ -22,6 +22,13 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def _platforms() -> list[Any]:
+    """Entity platforms this integration sets up (import deferred for tests)."""
+    from homeassistant.const import Platform
+
+    return [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE]
+
+
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up the ThatsMatter domain (YAML not used; config entry only)."""
     hass.data.setdefault(DOMAIN, {})
@@ -34,13 +41,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     Assumes an external bridge process is (or will be) listening on the
     configured host/port. Does not spawn the binary yet.
     """
-    from homeassistant.const import Platform
-
     from .coordinator import ThatsMatterRuntime
     from .services import async_register_services
     from .store import ExportStore
 
-    platforms = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE]
+    platforms = _platforms()
 
     hass.data.setdefault(DOMAIN, {})
 
@@ -74,10 +79,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a ThatsMatter config entry."""
-    from homeassistant.const import Platform
-
-    platforms = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE]
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, _platforms())
     runtime = hass.data[DOMAIN].pop(entry.entry_id, None)
     if runtime is not None:
         await runtime.async_stop()

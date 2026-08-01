@@ -291,28 +291,19 @@ impl CatalogStore {
 
   fn alloc_endpoint(&mut self) -> Result<u16, CatalogError> {
     let used: BTreeSet<u16> = self.by_id.values().filter_map(|e| e.endpoint_id).collect();
-    // Prefer monotonic next_endpoint; if wrapped, scan for free slot.
+    // Ids 1..=u16::MAX are assignable (0 is the Matter root endpoint).
+    if used.len() >= usize::from(u16::MAX) {
+      return Err(CatalogError::EndpointExhausted);
+    }
+    // Prefer monotonic next_endpoint; wrap past u16::MAX and skip taken ids.
     loop {
       if self.next_endpoint == 0 {
-        // Skip root endpoint 0.
         self.next_endpoint = FIRST_ENDPOINT_ID;
       }
       let candidate = self.next_endpoint;
       self.next_endpoint = self.next_endpoint.wrapping_add(1);
-      if !used.contains(&candidate) && candidate != 0 {
+      if !used.contains(&candidate) {
         return Ok(candidate);
-      }
-      if used.len() >= (u16::MAX as usize) {
-        return Err(CatalogError::EndpointExhausted);
-      }
-      // If we have scanned a full cycle of free ids somehow, still try fill gaps.
-      if used.len() < (u16::MAX as usize) && candidate == 0 {
-        for id in FIRST_ENDPOINT_ID..=u16::MAX {
-          if !used.contains(&id) {
-            return Ok(id);
-          }
-        }
-        return Err(CatalogError::EndpointExhausted);
       }
     }
   }
