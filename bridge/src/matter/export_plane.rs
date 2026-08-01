@@ -1219,36 +1219,61 @@ impl ExportPlane {
     let Some(req) = self.window_request.lock().take() else {
       return;
     };
-    let result = match req.op {
+    let result = self.execute_window_op(
+      req.op,
+      || Self::read_fabric_count(ctx),
+      || ctx.matter().close_comm_window(ctx).map_err(|err| format!("{err:?}")),
+      |timeout_secs| {
+        ctx
+          .matter()
+          .open_basic_comm_window(timeout_secs, ctx.crypto(), ctx)
+          .map_err(|err| format!("{err:?}"))
+      },
+    );
+    let _ = req.reply.send(result);
+  }
+
+  /// Pairing-window open/close decisions with injectable stack ops.
+  ///
+  /// Production binds the callbacks to the live Matter stack; unit tests inject
+  /// counters and controlled success/failure without a real stack.
+  fn execute_window_op(
+    &self,
+    op: WindowOp,
+    mut fabric_count: impl FnMut() -> u8,
+    mut close_comm_window: impl FnMut() -> Result<bool, String>,
+    mut open_basic_comm_window: impl FnMut(u16) -> Result<(), String>,
+  ) -> Result<(), String> {
+    match op {
       WindowOp::Open(timeout_secs) => {
         // Baseline fabrics before open so a same-iteration sample (or a count
         // that already rose while we still held a stale prev) cannot wipe the
         // new deadline via `count > prev`.
-        let count = Self::read_fabric_count(ctx);
+        let count = fabric_count();
         self.establish_fabric_baseline(count);
 
         // rs-matter rejects open while a window is already open. Close first so
         // "Open pairing window" is idempotent for multi-admin re-pair.
         // On successful close, clear our deadline immediately: if the subsequent
         // open fails we must stay closed (no stale pairing_open).
-        match ctx.matter().close_comm_window(ctx) {
+        match close_comm_window() {
           Ok(_) => self.mark_window_closed(),
           Err(err) => {
-            tracing::warn!(error = ?err, "pre-open close_comm_window failed; still attempting open");
+            tracing::warn!(error = %err, "pre-open close_comm_window failed; still attempting open");
           }
         }
 
-        match ctx.matter().open_basic_comm_window(timeout_secs, ctx.crypto(), ctx) {
+        match open_basic_comm_window(timeout_secs) {
           Ok(()) => {
-            let count = Self::read_fabric_count(ctx);
+            let count = fabric_count();
             self.mark_window_opened(timeout_secs, count);
             tracing::info!(timeout_secs, "basic commissioning window opened");
             Ok(())
           }
           Err(err) => {
             // Pre-open close already cleared the deadline on success; keep closed.
-            tracing::warn!(error = ?err, "open_basic_comm_window failed");
-            Err(format!("open pairing window failed: {err:?}"))
+            tracing::warn!(error = %err, "open_basic_comm_window failed");
+            Err(format!("open pairing window failed: {err}"))
           }
         }
       }
@@ -1261,21 +1286,20 @@ impl ExportPlane {
           tracing::debug!("close pairing window: no bridge-tracked window; skip stack close");
           Ok(())
         } else {
-          match ctx.matter().close_comm_window(ctx) {
+          match close_comm_window() {
             Ok(was_open) => {
               self.mark_window_closed();
               tracing::info!(was_open, "commissioning window closed");
               Ok(())
             }
             Err(err) => {
-              tracing::warn!(error = ?err, "close_comm_window failed");
-              Err(format!("close pairing window failed: {err:?}"))
+              tracing::warn!(error = %err, "close_comm_window failed");
+              Err(format!("close pairing window failed: {err}"))
             }
           }
         }
       }
-    };
-    let _ = req.reply.send(result);
+    }
   }
 
   /// Snapshot fabric count from the live stack; clear our window when a new fabric appears.
@@ -2526,8 +2550,8 @@ mod tests {
     );
   }
 
-  /// Same-iteration fabric-increase + open must not wipe a fresh window: establish
-  /// baseline before storing the new deadline (and sample-before-open in the run loop).
+  /// Same-iteration fabric-increase + open must not wipe a fresh window: the real
+  /// open path baselines fabrics before installing the new deadline.
   #[test]
   fn fabric_increase_then_open_keeps_new_deadline() {
     let plane = ExportPlane::new();
@@ -2536,25 +2560,42 @@ mod tests {
     assert!(plane.pairing_open());
     assert_eq!(plane.commissioned_fabrics(), 0);
 
-    // Pending fabric increase (commissioning completed) would clear the old window.
+    // Fabric increase (commissioning completed) clears the old window — mirrors
+    // run-loop sample_fabrics before drain_window_request.
     plane.apply_fabric_sample(1);
     assert!(!plane.pairing_open());
     assert_eq!(plane.commissioned_fabrics(), 1);
 
-    // Multi-admin re-open: baseline at current fabric count, then store deadline.
-    // A subsequent sample with the same count must not clear the window.
-    plane.mark_window_opened(300, 1);
+    // Multi-admin re-open via the real open-path control flow (not mark_window_opened).
+    let mut close_calls = 0u32;
+    let mut open_calls = 0u32;
+    let result = plane.execute_window_op(
+      WindowOp::Open(300),
+      || 1u8,
+      || {
+        close_calls += 1;
+        Ok(true)
+      },
+      |_timeout| {
+        open_calls += 1;
+        Ok(())
+      },
+    );
+    assert!(result.is_ok());
+    assert_eq!(close_calls, 1);
+    assert_eq!(open_calls, 1);
     assert!(plane.pairing_open());
+    // Same fabric count after open must not clear the new deadline.
     plane.apply_fabric_sample(1);
     assert!(
       plane.pairing_open(),
-      "same fabric count after open must not clear the new deadline"
+      "baseline before deadline must keep open at the same fabric count"
     );
     assert_eq!(plane.commissioned_fabrics(), 1);
   }
 
   /// Regression: opening without re-baselining leaves a stale prev; next sample wipes
-  /// the fresh open. Documents why mark_window_opened stores fabric_count first.
+  /// the fresh open. Documents why the open path stores fabric_count before deadline.
   #[test]
   fn fabric_increase_open_race_without_baseline_would_wipe() {
     let plane = ExportPlane::new();
@@ -2573,31 +2614,48 @@ mod tests {
       "stale prev makes count>prev wipe a deadline set without re-baseline"
     );
 
-    // Correct path: re-baseline before deadline so the same sample is a no-op.
-    plane.mark_window_opened(300, 1);
+    // Correct path: open-path re-baselines before deadline so the same sample is a no-op.
+    let result = plane.execute_window_op(WindowOp::Open(300), || 1u8, || Ok(true), |_timeout| Ok(()));
+    assert!(result.is_ok());
     assert!(plane.pairing_open());
     plane.apply_fabric_sample(1);
     assert!(plane.pairing_open());
   }
 
-  /// Close-then-open failure: after successful pre-open close the deadline is cleared,
-  /// so a failed open leaves pairing_open false (no stale open status).
+  /// Close-then-open failure: real open path closes first (clears deadline), then
+  /// open fails → final deadline stays zero (no stale pairing_open).
   #[test]
   fn close_success_open_failure_leaves_window_closed() {
     let plane = ExportPlane::new();
     plane.note_startup_commissioning_state(0);
     assert!(plane.pairing_open());
 
-    // Pre-open close succeeded → clear deadline before attempting open.
-    plane.mark_window_closed();
+    let mut close_calls = 0u32;
+    let mut open_calls = 0u32;
+    let result = plane.execute_window_op(
+      WindowOp::Open(300),
+      || 0u8,
+      || {
+        close_calls += 1;
+        Ok(true)
+      },
+      |_timeout| {
+        open_calls += 1;
+        Err("stack rejected open".into())
+      },
+    );
+    assert!(result.is_err(), "open failure must surface as Err");
+    assert_eq!(close_calls, 1, "open path must call stack close first");
+    assert_eq!(open_calls, 1, "open path must attempt stack open after close");
     assert!(!plane.pairing_open());
-
-    // Open fails: we must not restore a deadline. Stay closed.
-    assert!(!plane.pairing_open());
-    assert_eq!(plane.window_deadline.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      plane.window_deadline.load(Ordering::SeqCst),
+      0,
+      "failed open after successful pre-open close must leave deadline zero"
+    );
   }
 
-  /// Close is idempotent when we do not track an open window (do not imply a stack close).
+  /// Close is idempotent when we do not track an open window: stack close is not called.
   #[test]
   fn close_untracked_window_is_idempotent_without_stack() {
     let plane = ExportPlane::new();
@@ -2605,14 +2663,51 @@ mod tests {
     plane.note_startup_commissioning_state(1);
     assert!(!plane.pairing_open());
 
-    // Gating decision used by drain_window_request: skip close_comm_window.
-    assert!(
-      !plane.pairing_open(),
-      "no bridge-tracked window → close must not call the stack"
+    let mut close_calls = 0u32;
+    let mut open_calls = 0u32;
+    let result = plane.execute_window_op(
+      WindowOp::Close,
+      || 1u8,
+      || {
+        close_calls += 1;
+        Ok(true)
+      },
+      |_timeout| {
+        open_calls += 1;
+        Ok(())
+      },
     );
-    plane.mark_window_closed();
+    assert!(result.is_ok());
+    assert_eq!(
+      close_calls, 0,
+      "close_comm_window must not be called when !pairing_open"
+    );
+    assert_eq!(open_calls, 0);
     assert!(!plane.pairing_open());
     assert_eq!(plane.commissioned_fabrics(), 1);
+  }
+
+  /// Tracked open window: close path does invoke stack close and clears the deadline.
+  #[test]
+  fn close_tracked_window_calls_stack_close() {
+    let plane = ExportPlane::new();
+    plane.note_startup_commissioning_state(0);
+    assert!(plane.pairing_open());
+
+    let mut close_calls = 0u32;
+    let result = plane.execute_window_op(
+      WindowOp::Close,
+      || 0u8,
+      || {
+        close_calls += 1;
+        Ok(true)
+      },
+      |_timeout| panic!("open must not be called for Close"),
+    );
+    assert!(result.is_ok());
+    assert_eq!(close_calls, 1);
+    assert!(!plane.pairing_open());
+    assert_eq!(plane.window_deadline.load(Ordering::SeqCst), 0);
   }
 
   #[test]

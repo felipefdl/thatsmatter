@@ -23,7 +23,7 @@ from .const import COMMAND_POLL_INTERVAL, DOMAIN, STATUS_POLL_INTERVAL
 from .helpers import (
     ha_state_value,
     matter_level_to_ha_brightness,
-    should_show_pairing_notification,
+    pairing_notification_action,
 )
 from .models import Export
 from .store import ExportStore
@@ -159,16 +159,18 @@ class ThatsMatterRuntime:
         disconnected, or pairing material is unavailable.
         """
         code = self.pairing.get("setup_code")
-        if not should_show_pairing_notification(
+        action = pairing_notification_action(
             bridge_connected=self.bridge_connected,
             pairing_open=self.pairing_window_open,
-            has_setup_code=bool(code),
-        ):
+            setup_code=str(code) if code else None,
+            last_notified_code=self._last_notified_code,
+        )
+        if action == "dismiss":
             await self.async_dismiss_pairing_notification()
             return
-        code_s = str(code)
-        if code_s == self._last_notified_code:
+        if action == "noop":
             return
+        code_s = str(code)
         self._last_notified_code = code_s
         message = (
             f"**ThatsMatter is ready to pair**\n\n"

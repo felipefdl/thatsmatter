@@ -245,3 +245,29 @@ def should_show_pairing_notification(
 ) -> bool:
     """Whether the persistent pairing notification should remain visible."""
     return bool(bridge_connected and pairing_open and has_setup_code)
+
+
+def pairing_notification_action(
+    *,
+    bridge_connected: bool,
+    pairing_open: bool,
+    setup_code: str | None,
+    last_notified_code: str | None,
+) -> str:
+    """Decide how to reconcile the pairing drawer notification.
+
+    Returns one of:
+    - ``\"dismiss\"`` — window closed, bridge disconnected, or no setup code
+    - ``\"create\"`` — show (or refresh) the notification for a new code
+    - ``\"noop\"`` — already showing this code; leave the drawer alone
+    """
+    if not should_show_pairing_notification(
+        bridge_connected=bridge_connected,
+        pairing_open=pairing_open,
+        has_setup_code=bool(setup_code),
+    ):
+        return "dismiss"
+    code_s = str(setup_code)
+    if code_s == last_notified_code:
+        return "noop"
+    return "create"

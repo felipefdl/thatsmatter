@@ -21,6 +21,7 @@ from custom_components.thatsmatter.helpers import (  # noqa: E402
     is_supported_type,
     matter_level_to_ha_brightness,
     pairing_credentials_for_display,
+    pairing_notification_action,
     should_show_pairing_notification,
     validate_export_fields,
 )
@@ -201,4 +202,69 @@ def test_should_show_pairing_notification_gating() -> None:
         bridge_connected=True,
         pairing_open=True,
         has_setup_code=False,
+    )
+
+
+def test_pairing_notification_action_dismisses_when_closed_or_disconnected() -> None:
+    """Reconciliation returns dismiss (not merely a false show-predicate).
+
+    Coordinator maps this action to async_dismiss_pairing_notification.
+    """
+    assert (
+        pairing_notification_action(
+            bridge_connected=True,
+            pairing_open=False,
+            setup_code="1234-567-8901",
+            last_notified_code="1234-567-8901",
+        )
+        == "dismiss"
+    )
+    assert (
+        pairing_notification_action(
+            bridge_connected=False,
+            pairing_open=True,
+            setup_code="1234-567-8901",
+            last_notified_code="1234-567-8901",
+        )
+        == "dismiss"
+    )
+    assert (
+        pairing_notification_action(
+            bridge_connected=True,
+            pairing_open=True,
+            setup_code=None,
+            last_notified_code="1234-567-8901",
+        )
+        == "dismiss"
+    )
+
+
+def test_pairing_notification_action_create_and_noop() -> None:
+    """Show when open+connected+code; noop when the same code is already shown."""
+    assert (
+        pairing_notification_action(
+            bridge_connected=True,
+            pairing_open=True,
+            setup_code="1234-567-8901",
+            last_notified_code=None,
+        )
+        == "create"
+    )
+    assert (
+        pairing_notification_action(
+            bridge_connected=True,
+            pairing_open=True,
+            setup_code="1234-567-8901",
+            last_notified_code="1234-567-8901",
+        )
+        == "noop"
+    )
+    assert (
+        pairing_notification_action(
+            bridge_connected=True,
+            pairing_open=True,
+            setup_code="9999-888-7777",
+            last_notified_code="1234-567-8901",
+        )
+        == "create"
     )
