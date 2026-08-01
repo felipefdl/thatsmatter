@@ -2,7 +2,7 @@
 //!
 //! Runs an Ethernet (IP) OnOff light endpoint that tracks the primary enabled
 //! OnOff export from the catalog. Controllers (HA Matter Server, chip-tool,
-//! Alexa, etc.) can commission using the test-device pairing material.
+//! Alexa, etc.) commission using this install's pairing material.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -16,8 +16,9 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::backend::MatterBackend;
+use super::commissioning::CommissioningMaterial;
 use super::on_off_map::{on_off_command, on_off_from_states, primary_on_off_export};
-use super::pairing::test_device_pairing_material;
+use super::pairing::{basic_comm_data, pairing_material_for};
 use crate::catalog::{CommandRequest, Export, HaStateValue, PairingMaterial};
 use crate::config::BackendKind;
 
@@ -121,31 +122,36 @@ pub struct RsMatterBackend {
   error: Mutex<Option<String>>,
   /// Matter stack thread (keeps process advertising while join handle is alive).
   _stack_thread: Mutex<Option<JoinHandle<()>>>,
+  commissioning: CommissioningMaterial,
   pairing: PairingMaterial,
 }
 
 impl RsMatterBackend {
-  pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-    Self {
-      data_dir: data_dir.into(),
+  pub fn new(data_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    let data_dir = data_dir.into();
+    let commissioning = CommissioningMaterial::load_or_generate(&data_dir)?;
+    Ok(Self {
+      data_dir,
       shared: Arc::new(SharedLight::new()),
       running: AtomicBool::new(false),
       pairing_open: AtomicBool::new(false),
       error: Mutex::new(None),
       _stack_thread: Mutex::new(None),
-      pairing: test_device_pairing_material(),
-    }
+      pairing: pairing_material_for(&commissioning),
+      commissioning,
+    })
   }
 
   fn spawn_stack(&self) -> anyhow::Result<()> {
     let data_dir = self.data_dir.clone();
+    let commissioning = self.commissioning;
     let shared = Arc::clone(&self.shared);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handle = thread::Builder::new()
       .name("thatsmatter-matter".into())
       .spawn(move || {
-        if let Err(err) = run_matter_stack(data_dir, shared, ready_tx) {
+        if let Err(err) = run_matter_stack(data_dir, commissioning, shared, ready_tx) {
           tracing::error!(error = %err, "Matter stack thread exited with error");
         }
       })?;
@@ -170,6 +176,7 @@ impl RsMatterBackend {
 
 fn run_matter_stack(
   data_dir: PathBuf,
+  commissioning: CommissioningMaterial,
   shared: Arc<SharedLight>,
   ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -181,7 +188,7 @@ fn run_matter_stack(
   use rs_matter_stack::matter::dm::clusters::desc;
   use rs_matter_stack::matter::dm::clusters::desc::ClusterHandler as _;
   use rs_matter_stack::matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
-  use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
+  use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
   use rs_matter_stack::matter::dm::networks::unix::UnixNetifs;
   use rs_matter_stack::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, EpClMatcher, Node};
   use rs_matter_stack::matter::persist::DirKvBlobStore;
@@ -196,9 +203,13 @@ fn run_matter_stack(
   static MATTER_STACK: StaticCell<EthMatterStack<BUMP_SIZE, ()>> = StaticCell::new();
 
   let result = (|| -> Result<(), String> {
-    let stack = MATTER_STACK
-      .uninit()
-      .init_with(EthMatterStack::init(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT));
+    // Attestation stays on the CSA test credentials (TEST_DEV_DET keeps VID 0xFFF1 / PID 0x8001,
+    // which the example CD is bound to); only the pairing material is per install.
+    let stack = MATTER_STACK.uninit().init_with(EthMatterStack::init(
+      &TEST_DEV_DET,
+      basic_comm_data(&commissioning),
+      &TEST_DEV_ATT,
+    ));
 
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
     let mut rand_src = crypto.weak_rand().map_err(|e| format!("rand: {e:?}"))?;

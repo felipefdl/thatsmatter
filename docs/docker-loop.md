@@ -79,5 +79,5 @@ Exit `0` = commission OK. Exit `2` = environment / discovery / commission failur
 ## Known limits
 
 - One Matter OnOff endpoint is bound to the **primary** enabled OnOff export (lowest `endpoint_id`). Catalog may hold more exports; only the primary is on the fabric until multi-endpoint bridge work lands.
-- Pairing uses CSA **test** VID/PID/passcode (`20202021` / discriminator `3840`). Controllers may show “uncertified”.
+- The setup passcode and discriminator are random per install, stored in `<data-dir>/commissioning.json`. Attestation still uses the CSA **test** VID/PID, so controllers may show “uncertified”.
 - Docker Desktop on macOS: containers may start and bridge IPC works, but Matter mDNS discovery between Matter Server and the bridge often fails (`commission_with_code` error_code=1). That is an environment failure of the full loop, not a silent skip.

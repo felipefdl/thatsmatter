@@ -9,7 +9,7 @@ Rust process: Matter node + loopback HTTP JSON control plane for the Home Assist
 | `rs_matter` (default) | `rs-matter` + `rs-matter-stack` Ethernet OnOff device; real pairing codes; mDNS |
 | `dev` | Offline IPC only; same pairing code algorithm; no network advertise |
 
-Pairing uses CSA **test** device constants (passcode `20202021`, discriminator `3840`). Controllers may show uncertified prompts.
+The setup passcode and discriminator are random per install, generated on first start and stored in `<data-dir>/commissioning.json`. Device attestation still uses CSA **test** credentials, so controllers may show uncertified prompts.
 
 ## Endpoint model
 

@@ -16,7 +16,7 @@ use uuid::Uuid;
 async fn test_app() -> (axum::Router, Arc<DevMatterBackend>, tempfile::TempDir) {
   let dir = tempfile::tempdir().unwrap();
   let catalog = CatalogStore::new(dir.path(), "ThatsMatter");
-  let backend = Arc::new(DevMatterBackend::new(dir.path()));
+  let backend = Arc::new(DevMatterBackend::new(dir.path()).unwrap());
   backend.start().await.unwrap();
   let state = Arc::new(AppState::new(catalog, backend.clone() as Arc<dyn MatterBackend>));
   (ipc::router(state), backend, dir)
@@ -262,7 +262,7 @@ async fn state_push_and_command_queue() {
 }
 
 #[tokio::test]
-async fn pairing_returns_placeholders() {
+async fn pairing_returns_commissionable_material() {
   let (app, _, _dir) = test_app().await;
   let res = app
     .oneshot(

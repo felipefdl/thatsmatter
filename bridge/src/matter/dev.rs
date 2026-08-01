@@ -1,4 +1,4 @@
-//! Development Matter backend: full catalog/command API with placeholder pairing.
+//! Development Matter backend: full catalog/command API without a transport stack.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -9,15 +9,16 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::backend::MatterBackend;
+use super::commissioning::CommissioningMaterial;
 use super::on_off_map::{on_off_command, on_off_from_states};
-use super::pairing::test_device_pairing_material;
+use super::pairing::pairing_material_for;
 use crate::catalog::{CommandRequest, DeviceType, Export, HaStateValue, PairingMaterial};
 use crate::config::BackendKind;
 
 /// Offline Matter backend for IPC/unit tests without starting the transport stack.
 ///
-/// Uses the same commissionable pairing material as the real `rs_matter` backend
-/// (CSA test VID/PID/passcode), but does not advertise Matter on the network.
+/// Serves this install's pairing material, the same way the real `rs_matter`
+/// backend does, but does not advertise Matter on the network.
 /// Use `RsMatterBackend` for a live commissionable node.
 pub struct DevMatterBackend {
   data_dir: PathBuf,
@@ -32,17 +33,19 @@ pub struct DevMatterBackend {
 }
 
 impl DevMatterBackend {
-  pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-    Self {
-      data_dir: data_dir.into(),
+  pub fn new(data_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    let data_dir = data_dir.into();
+    let material = CommissioningMaterial::load_or_generate(&data_dir)?;
+    Ok(Self {
+      data_dir,
       running: AtomicBool::new(false),
       pairing_open: AtomicBool::new(true),
       exports: Mutex::new(Vec::new()),
       entity_state: Mutex::new(BTreeMap::new()),
       commands: Mutex::new(VecDeque::new()),
       error: Mutex::new(None),
-      pairing: test_device_pairing_material(),
-    }
+      pairing: pairing_material_for(&material),
+    })
   }
 
   /// Test helper: enqueue a command as if a Matter controller issued it.
@@ -162,24 +165,32 @@ mod tests {
   use tempfile::tempdir;
 
   #[tokio::test]
-  async fn pairing_material_non_empty() {
+  async fn pairing_material_matches_stored_commissioning_data() {
     let dir = tempdir().unwrap();
-    let backend = DevMatterBackend::new(dir.path());
+    let backend = DevMatterBackend::new(dir.path()).unwrap();
     backend.start().await.unwrap();
+    let material = CommissioningMaterial::load_or_generate(dir.path()).unwrap();
     let p = backend.pairing_info().await;
     assert!(!p.setup_code.is_empty());
-    assert!(!p.qr_payload.is_empty());
     assert!(p.qr_payload.starts_with("MT:"));
-    assert_eq!(p.discriminator, crate::matter::pairing::TEST_DISCRIMINATOR);
-    assert_eq!(p.passcode, crate::matter::pairing::TEST_PASSCODE);
+    assert_eq!(p.discriminator, u32::from(material.discriminator));
+    assert_eq!(p.passcode, material.passcode);
     assert!(backend.is_running().await);
     assert!(backend.pairing_open().await);
   }
 
   #[tokio::test]
+  async fn pairing_material_survives_restart_on_same_data_dir() {
+    let dir = tempdir().unwrap();
+    let first = DevMatterBackend::new(dir.path()).unwrap().pairing_info().await;
+    let restarted = DevMatterBackend::new(dir.path()).unwrap().pairing_info().await;
+    assert_eq!(first, restarted);
+  }
+
+  #[tokio::test]
   async fn controller_on_off_enqueues_command() {
     let dir = tempdir().unwrap();
-    let backend = DevMatterBackend::new(dir.path());
+    let backend = DevMatterBackend::new(dir.path()).unwrap();
     backend.start().await.unwrap();
     let id = Uuid::new_v4();
     backend.simulate_controller_on_off(id, true);
@@ -192,7 +203,7 @@ mod tests {
   #[tokio::test]
   async fn command_queue_drain() {
     let dir = tempdir().unwrap();
-    let backend = DevMatterBackend::new(dir.path());
+    let backend = DevMatterBackend::new(dir.path()).unwrap();
     backend.start().await.unwrap();
     let id = Uuid::new_v4();
     backend.push_command(CommandRequest {
@@ -211,7 +222,7 @@ mod tests {
   #[tokio::test]
   async fn apply_state_counts_and_stores() {
     let dir = tempdir().unwrap();
-    let backend = DevMatterBackend::new(dir.path());
+    let backend = DevMatterBackend::new(dir.path()).unwrap();
     backend.start().await.unwrap();
     let id = Uuid::new_v4();
     let exp = Export {
