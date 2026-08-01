@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 use rs_matter::dm::clusters::decl::bridged_device_basic_information as bridged_info;
@@ -51,6 +51,8 @@ const NODE_LABEL_MAX_BYTES: usize = 32;
 /// Pending-report bits drained by the stack thread on every wake.
 const REPORT_ON_OFF: u32 = 1 << 0;
 const REPORT_NODE_LABEL: u32 = 1 << 1;
+/// Bridged-endpoint Descriptor (e.g. DeviceTypeList) after a surface change.
+const REPORT_DESCRIPTOR: u32 = 1 << 2;
 
 const DESC_CLUSTER: Cluster<'static> = desc::DescHandler::CLUSTER;
 
@@ -90,6 +92,8 @@ pub struct ExportSlot {
   pub export_id: Uuid,
   /// Catalog `endpoint_id` + 1, so the aggregator keeps endpoint 1.
   pub matter_endpoint: EndptId,
+  /// BDBI `NodeLabel` and the human-readable export name.
+  pub name: String,
   pub kind: SlotKind,
   /// Catalog export backing this slot; drives the HA state mapping.
   export: Export,
@@ -106,7 +110,7 @@ pub struct ExportSlot {
 impl ExportSlot {
   /// Export name as configured in the catalog.
   pub fn name(&self) -> &str {
-    &self.export.name
+    &self.name
   }
 
   /// Current on/off value as controllers should see it.
@@ -196,8 +200,14 @@ pub struct ExportPlane {
   /// Wakes `run()`: emit subscription reports, bump the configuration version.
   changed: Notify,
   commands: Mutex<VecDeque<CommandRequest>>,
-  /// Set when the exposed endpoint set changed and the stack owes a config bump.
-  config_dirty: AtomicBool,
+  /// Generation of the latest surface that still owes a `ConfigurationVersion` bump.
+  /// Advanced by `set_exports` on every real surface change; never goes backwards.
+  config_requested: AtomicU64,
+  /// Last generation the stack thread (or a test stand-in) successfully applied.
+  /// A bump is pending while `config_requested != config_applied`. Acknowledge only
+  /// the generation observed before the bump so a concurrent `set_exports` cannot
+  /// clear a newer request (the AtomicBool load/store race).
+  config_applied: AtomicU64,
   aggregator_dataver: AtomicU32,
 }
 
@@ -213,7 +223,8 @@ impl ExportPlane {
       state: RwLock::new(Arc::new(PlaneState::new(Vec::new(), BTreeSet::new()))),
       changed: Notify::new(),
       commands: Mutex::new(VecDeque::new()),
-      config_dirty: AtomicBool::new(false),
+      config_requested: AtomicU64::new(0),
+      config_applied: AtomicU64::new(0),
       aggregator_dataver: AtomicU32::new(rand::random()),
     }
   }
@@ -266,7 +277,9 @@ impl ExportPlane {
 
     if surface_changed {
       self.aggregator_dataver.fetch_add(1, Ordering::SeqCst);
-      self.config_dirty.store(true, Ordering::SeqCst);
+      // Bump the generation rather than flipping a bool: a concurrent run-loop
+      // clear of an older generation cannot erase this request.
+      self.config_requested.fetch_add(1, Ordering::SeqCst);
     }
     if surface_changed || work_pending {
       self.changed.notify_one();
@@ -352,6 +365,13 @@ impl ExportPlane {
             bridged_info::AttributeId::NodeLabel as AttrId,
           ));
         }
+        if bits & REPORT_DESCRIPTOR != 0 {
+          out.push((
+            slot.matter_endpoint,
+            DESC_CLUSTER.id,
+            desc::AttributeId::DeviceTypeList as AttrId,
+          ));
+        }
       }
       out
     })
@@ -393,6 +413,7 @@ impl ExportSlot {
     let slot = Self {
       export_id: export.export_id,
       matter_endpoint,
+      name: export.name.clone(),
       kind: SlotKind::OnOff {
         on: AtomicBool::new(previous.is_some_and(ExportSlot::on)),
       },
@@ -412,8 +433,11 @@ impl ExportSlot {
       slot.request_report(REPORT_NODE_LABEL);
     }
     if previous.is_some_and(|p| p.surface() != slot.surface()) {
-      // The endpoint's DeviceTypeList moved, so its Descriptor did too.
+      // DeviceTypeList (and the rest of Descriptor) moved on this bridged endpoint.
+      // Bump the data version and schedule a subscription notify so controllers that
+      // watch the endpoint Descriptor — not only root/aggregator PartsList — refresh.
       slot.desc_dataver.fetch_add(1, Ordering::SeqCst);
+      slot.request_report(REPORT_DESCRIPTOR);
     }
     slot
   }
@@ -554,20 +578,35 @@ impl AsyncHandler for ExportPlane {
     loop {
       self.changed.notified().await;
 
-      if self.config_dirty.load(Ordering::SeqCst) {
+      // Drain every outstanding config generation. Acknowledge only the generation
+      // observed before the bump: if `set_exports` advanced the counter while we
+      // were inside `bump_configuration_version`, the newer request stays pending
+      // and this loop continues without waiting for another notify.
+      loop {
+        let requested = self.config_requested.load(Ordering::SeqCst);
+        let applied = self.config_applied.load(Ordering::SeqCst);
+        if requested == applied {
+          break;
+        }
         match ctx.matter().bump_configuration_version(ctx.kv(), &ctx) {
           Ok(version) => {
-            // Cleared only on success, so a failed persist retries on the next change.
-            self.config_dirty.store(false, Ordering::SeqCst);
+            // Compare-and-clear: only advances `config_applied` up to `requested`.
+            // A concurrent fetch_add leaves requested > applied, so we loop again.
+            self.acknowledge_config_generation(requested);
             tracing::info!(
               configuration_version = version,
               endpoints = ?self.endpoint_ids(),
               "bridged endpoint set changed"
             );
           }
-          Err(err) => tracing::warn!(error = ?err, "configuration version bump failed; retrying on the next change"),
+          Err(err) => {
+            // Leave the generation pending so a later wake retries the persist.
+            tracing::warn!(error = ?err, "configuration version bump failed; retrying on the next change");
+            break;
+          }
         }
-        // PartsList moved on the root endpoint and on the aggregator.
+        // PartsList moved on the root endpoint and on the aggregator. Bridged
+        // endpoint Descriptor changes are reported via `drain_reports` below.
         ctx.notify_cluster_changed(ROOT_ENDPOINT_ID, DESC_CLUSTER.id);
         ctx.notify_cluster_changed(AGGREGATOR_ENDPOINT_ID, DESC_CLUSTER.id);
       }
@@ -684,16 +723,45 @@ impl on_off_decl::ClusterHandler for SlotOnOffHandler<'_> {
   }
 }
 
+impl ExportPlane {
+  /// Mark config bumps through `generation` as applied. A concurrent `set_exports`
+  /// that advanced past `generation` leaves the newer request pending.
+  fn acknowledge_config_generation(&self, generation: u64) {
+    let mut applied = self.config_applied.load(Ordering::SeqCst);
+    while applied < generation {
+      match self
+        .config_applied
+        .compare_exchange(applied, generation, Ordering::SeqCst, Ordering::SeqCst)
+      {
+        Ok(_) => break,
+        Err(current) => applied = current,
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 impl ExportPlane {
   /// Whether the stack still owes a `ConfigurationVersion` bump.
   fn config_bump_pending(&self) -> bool {
-    self.config_dirty.load(Ordering::SeqCst)
+    self.config_requested.load(Ordering::SeqCst) != self.config_applied.load(Ordering::SeqCst)
   }
 
-  /// Stand-in for the successful branch of the run loop's config bump.
+  /// Current surface generation requested by `set_exports`.
+  fn config_request_generation(&self) -> u64 {
+    self.config_requested.load(Ordering::SeqCst)
+  }
+
+  /// Stand-in for the successful branch of the run loop's config bump: claim the
+  /// latest outstanding generation and acknowledge it.
   fn take_config_bump(&self) -> bool {
-    self.config_dirty.swap(false, Ordering::SeqCst)
+    let requested = self.config_requested.load(Ordering::SeqCst);
+    let applied = self.config_applied.load(Ordering::SeqCst);
+    if requested == applied {
+      return false;
+    }
+    self.acknowledge_config_generation(requested);
+    true
   }
 
   /// Current on/off value of the slot backing `export_id`.
@@ -1086,5 +1154,189 @@ mod tests {
     let clamped = clamp_utf8(&long, NODE_LABEL_MAX_BYTES);
     assert!(clamped.len() <= NODE_LABEL_MAX_BYTES);
     assert_eq!(clamped, "é".repeat(16));
+  }
+
+  #[test]
+  fn export_slot_exposes_public_name() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Kitchen Lamp", "light.a", DeviceType::Light, true, Some(1))]);
+
+    let state = plane.snapshot();
+    let slot = state.slot_for(id).unwrap();
+    // Tasks 4/5 read the public field; the accessor must stay in lockstep.
+    assert_eq!(slot.name, "Kitchen Lamp");
+    assert_eq!(slot.name(), "Kitchen Lamp");
+  }
+
+  /// Deterministic regression for the AtomicBool load/store race:
+  /// run loop loads dirty, concurrent set_exports sets dirty, run loop clears —
+  /// the concurrent request must not be lost.
+  #[test]
+  fn concurrent_set_exports_cannot_drop_a_config_bump() {
+    let plane = ExportPlane::new();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    plane.set_exports(&[export(a, "A", "light.a", DeviceType::Light, true, Some(1))]);
+    assert!(plane.config_bump_pending());
+    let claimed = plane.config_request_generation();
+    assert!(claimed > 0);
+
+    // Surface change while a bump for `claimed` is "in flight".
+    plane.set_exports(&[
+      export(a, "A", "light.a", DeviceType::Light, true, Some(1)),
+      export(b, "B", "light.b", DeviceType::Light, true, Some(2)),
+    ]);
+    let after = plane.config_request_generation();
+    assert!(after > claimed, "later set_exports must advance the generation");
+    assert!(plane.config_bump_pending());
+
+    // Acknowledge only the generation the run loop observed before the race.
+    // An AtomicBool store(false) would clear both; the generation protocol must not.
+    plane.acknowledge_config_generation(claimed);
+    assert!(
+      plane.config_bump_pending(),
+      "a concurrent surface change must still owe a ConfigurationVersion bump"
+    );
+
+    // Clearing the latest generation retires the debt.
+    assert!(plane.take_config_bump());
+    assert!(!plane.config_bump_pending());
+  }
+
+  /// Multi-thread stress: writers flip the surface while a stand-in run loop
+  /// acknowledges only the generation it observed (never a blind clear).
+  #[test]
+  fn config_bump_generation_survives_cross_thread_set_exports() {
+    use std::sync::Barrier;
+
+    let plane = Arc::new(ExportPlane::new());
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    plane.set_exports(&[export(a, "A", "light.a", DeviceType::Light, true, Some(1))]);
+    assert!(plane.take_config_bump());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let runner = {
+      let plane = Arc::clone(&plane);
+      let stop = Arc::clone(&stop);
+      let barrier = Arc::clone(&barrier);
+      std::thread::spawn(move || {
+        barrier.wait();
+        loop {
+          let requested = plane.config_request_generation();
+          if plane.config_bump_pending() {
+            // In-flight window: yield so writers can interleave a set_exports.
+            std::thread::yield_now();
+            plane.acknowledge_config_generation(requested);
+          } else if stop.load(Ordering::SeqCst) {
+            break;
+          } else {
+            std::thread::yield_now();
+          }
+        }
+        // Final drain after writers stop.
+        if plane.config_bump_pending() {
+          let requested = plane.config_request_generation();
+          plane.acknowledge_config_generation(requested);
+        }
+      })
+    };
+
+    barrier.wait();
+    for i in 0..400 {
+      if i % 2 == 0 {
+        plane.set_exports(&[export(a, "A", "light.a", DeviceType::Light, true, Some(1))]);
+      } else {
+        plane.set_exports(&[
+          export(a, "A", "light.a", DeviceType::Light, true, Some(1)),
+          export(b, "B", "switch.b", DeviceType::OnOffPlug, true, Some(2)),
+        ]);
+      }
+    }
+    stop.store(true, Ordering::SeqCst);
+    runner.join().expect("config bump runner");
+
+    // If any generation were lost, a debt would remain.
+    assert!(
+      !plane.config_bump_pending(),
+      "every surface change must have been acknowledged"
+    );
+  }
+
+  #[test]
+  fn device_type_change_notifies_bridged_endpoint_descriptor() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Lamp", "light.a", DeviceType::Light, true, Some(1))]);
+    assert!(plane.take_config_bump());
+    assert!(plane.drain_reports().is_empty());
+
+    let desc_before = plane
+      .snapshot()
+      .slot_for(id)
+      .unwrap()
+      .desc_dataver
+      .load(Ordering::SeqCst);
+
+    // Same export_id and endpoint, different concrete device type.
+    plane.set_exports(&[export(id, "Lamp", "switch.a", DeviceType::OnOffPlug, true, Some(1))]);
+
+    assert!(plane.config_bump_pending(), "device-type change is a surface change");
+    let desc_after = plane
+      .snapshot()
+      .slot_for(id)
+      .unwrap()
+      .desc_dataver
+      .load(Ordering::SeqCst);
+    assert_ne!(desc_before, desc_after, "bridged Descriptor dataver must move");
+
+    assert_eq!(
+      plane.drain_reports(),
+      vec![(2, DESC_CLUSTER.id, desc::AttributeId::DeviceTypeList as AttrId)],
+      "controllers subscribed to the bridged Descriptor must be notified"
+    );
+
+    plane.access(|node| {
+      let dtypes: Vec<u16> = node.endpoint(2).unwrap().device_types.iter().map(|d| d.dtype).collect();
+      assert_eq!(
+        dtypes,
+        vec![DEV_TYPE_ON_OFF_PLUG_IN_UNIT.dtype, DEV_TYPE_BRIDGED_NODE.dtype]
+      );
+    });
+  }
+
+  #[test]
+  fn device_type_stable_across_identical_rebuild_skips_descriptor_report() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    let exports = [export(id, "Lamp", "light.a", DeviceType::Light, true, Some(1))];
+    plane.set_exports(&exports);
+    plane.take_config_bump();
+    plane.drain_reports();
+
+    let desc_before = plane
+      .snapshot()
+      .slot_for(id)
+      .unwrap()
+      .desc_dataver
+      .load(Ordering::SeqCst);
+
+    plane.set_exports(&exports);
+    assert!(!plane.config_bump_pending());
+    assert!(
+      plane.drain_reports().is_empty(),
+      "stable surface must not re-notify Descriptor"
+    );
+    assert_eq!(
+      plane
+        .snapshot()
+        .slot_for(id)
+        .unwrap()
+        .desc_dataver
+        .load(Ordering::SeqCst),
+      desc_before
+    );
   }
 }
