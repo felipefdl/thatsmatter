@@ -7,8 +7,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use async_trait::async_trait;
@@ -88,9 +88,7 @@ impl rs_matter_stack::matter::dm::clusters::app::on_off::OnOffHooks for ExportOn
 
   fn start_up_on_off(
     &self,
-  ) -> rs_matter_stack::matter::tlv::Nullable<
-    rs_matter_stack::matter::dm::clusters::app::on_off::StartUpOnOffEnum,
-  > {
+  ) -> rs_matter_stack::matter::tlv::Nullable<rs_matter_stack::matter::dm::clusters::app::on_off::StartUpOnOffEnum> {
     rs_matter_stack::matter::tlv::Nullable::none()
   }
 
@@ -109,10 +107,7 @@ impl rs_matter_stack::matter::dm::clusters::app::on_off::OnOffHooks for ExportOn
   ) {
   }
 
-  async fn run<F: Fn(rs_matter_stack::matter::dm::clusters::app::on_off::OutOfBandMessage)>(
-    &self,
-    _notify: F,
-  ) {
+  async fn run<F: Fn(rs_matter_stack::matter::dm::clusters::app::on_off::OutOfBandMessage)>(&self, _notify: F) {
     core::future::pending::<()>().await;
   }
 }
@@ -179,16 +174,14 @@ fn run_matter_stack(
   ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
   use rs_matter_stack::eth::EthMatterStack;
-  use rs_matter_stack::matter::crypto::{default_crypto, Crypto};
+  use rs_matter_stack::matter::crypto::{Crypto, default_crypto};
   use rs_matter_stack::matter::dm::clusters::app::on_off;
-  use rs_matter_stack::matter::dm::clusters::app::on_off::test::TestOnOffDeviceLogic;
   use rs_matter_stack::matter::dm::clusters::app::on_off::OnOffHooks;
+  use rs_matter_stack::matter::dm::clusters::app::on_off::test::TestOnOffDeviceLogic;
   use rs_matter_stack::matter::dm::clusters::desc;
   use rs_matter_stack::matter::dm::clusters::desc::ClusterHandler as _;
-  use rs_matter_stack::matter::dm::devices::test::{
-    DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET,
-  };
   use rs_matter_stack::matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
+  use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
   use rs_matter_stack::matter::dm::networks::unix::UnixNetifs;
   use rs_matter_stack::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, EpClMatcher, Node};
   use rs_matter_stack::matter::persist::DirKvBlobStore;
@@ -203,11 +196,9 @@ fn run_matter_stack(
   static MATTER_STACK: StaticCell<EthMatterStack<BUMP_SIZE, ()>> = StaticCell::new();
 
   let result = (|| -> Result<(), String> {
-    let stack = MATTER_STACK.uninit().init_with(EthMatterStack::init(
-      &TEST_DEV_DET,
-      TEST_DEV_COMM,
-      &TEST_DEV_ATT,
-    ));
+    let stack = MATTER_STACK
+      .uninit()
+      .init_with(EthMatterStack::init(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT));
 
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
     let mut rand_src = crypto.weak_rand().map_err(|e| format!("rand: {e:?}"))?;
@@ -215,18 +206,11 @@ fn run_matter_stack(
     let hooks = ExportOnOffHooks {
       shared: Arc::clone(&shared),
     };
-    let on_off = on_off::OnOffHandler::new_standalone(
-      Dataver::new_rand(&mut rand_src),
-      LIGHT_ENDPOINT_ID,
-      hooks,
-    );
+    let on_off = on_off::OnOffHandler::new_standalone(Dataver::new_rand(&mut rand_src), LIGHT_ENDPOINT_ID, hooks);
 
     let handler = EmptyHandler
       .chain(
-        EpClMatcher::new(
-          Some(LIGHT_ENDPOINT_ID),
-          Some(TestOnOffDeviceLogic::CLUSTER.id),
-        ),
+        EpClMatcher::new(Some(LIGHT_ENDPOINT_ID), Some(TestOnOffDeviceLogic::CLUSTER.id)),
         on_off::HandlerAsyncAdaptor(&on_off),
       )
       .chain(
@@ -239,14 +223,13 @@ fn run_matter_stack(
     std::fs::create_dir_all(&store_path).map_err(|e| e.to_string())?;
 
     let mut store = DirKvBlobStore::new(store_path);
-    futures_lite::future::block_on(stack.startup(&crypto, &mut store))
-      .map_err(|e| format!("startup: {e:?}"))?;
+    futures_lite::future::block_on(stack.startup(&crypto, &mut store)).map_err(|e| format!("startup: {e:?}"))?;
 
     let kv = stack.matter().kv(store);
 
-    let _ = stack.matter().print_standard_qr_text(
-      rs_matter_stack::matter::pairing::DiscoveryCapabilities::IP,
-    );
+    let _ = stack
+      .matter()
+      .print_standard_qr_text(rs_matter_stack::matter::pairing::DiscoveryCapabilities::IP);
 
     // Match light_eth example: const cluster metadata for the OnOff light endpoint.
     const NODE: Node = Node {

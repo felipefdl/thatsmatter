@@ -1,8 +1,8 @@
 //! Real Matter pairing material derived from CSA test commissioning constants.
 
 use rs_matter::dm::devices::test::{TEST_DEV_COMM, TEST_DEV_DET};
-use rs_matter::pairing::qr::{no_optional_data, CommFlowType, QrPayload};
 use rs_matter::pairing::DiscoveryCapabilities;
+use rs_matter::pairing::qr::{CommFlowType, QrPayload, no_optional_data};
 
 use crate::catalog::PairingMaterial;
 

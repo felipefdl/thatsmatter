@@ -32,10 +32,10 @@ pub fn on_off_from_states(export: &Export, states: &[HaStateValue]) -> Option<bo
     return None;
   }
   for st in states {
-    if st.entity_id == export.primary_entity_id {
-      if let Some(on) = ha_state_is_on(&st.state) {
-        return Some(on);
-      }
+    if st.entity_id == export.primary_entity_id
+      && let Some(on) = ha_state_is_on(&st.state)
+    {
+      return Some(on);
     }
   }
   for st in states {
