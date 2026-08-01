@@ -63,7 +63,7 @@ impl LanNetifs {
   ///
   /// - **Pin missing:** hard error with available interface names.
   /// - **Pin present, no IPv6:** hard error (Matter needs IPv6; link-local OK).
-  /// - **Pin present, down:** OK (stack waits via [`NetChangeNotif`]); warn only.
+  /// - **Pin present, down:** hard error (do not claim ready until the face is up).
   /// - **Auto:** require at least one IPv6-capable non-virtual operational face.
   pub fn validate_for_start(&self) -> Result<(), String> {
     let ifaces = UnixNetifs
@@ -86,10 +86,10 @@ impl LanNetifs {
           ));
         }
         Some(iface) if !iface.operational => {
-          tracing::warn!(
-            %pin,
-            "pinned interface is down; Matter will wait for it via netif change notifications"
-          );
+          return Err(format!(
+            "pinned interface `{pin}` is down (not operational). Bring the link up or clear \
+             the LAN interface option for auto-select."
+          ));
         }
         Some(_) => {}
       }
