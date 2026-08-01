@@ -213,7 +213,7 @@ fn run_matter_stack(
   use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
   use rs_matter_stack::matter::persist::DirKvBlobStore;
   use rs_matter_stack::matter::transport::network::mdns::avahi::AvahiMdns;
-  use rs_matter_stack::matter::transport::network::mdns::zeroconf::ZeroconfMdns;
+  use rs_matter_stack::matter::transport::network::mdns::builtin::BuiltinMdns;
   use rs_matter_stack::matter::utils::init::InitMaybeUninit;
   use rs_matter_stack::matter::utils::zbus::Connection;
 
@@ -267,12 +267,14 @@ fn run_matter_stack(
     lan.log_inventory();
     lan.validate_for_start()?;
 
-    // Choose mDNS backend before ready: system bus alone is not enough — probe Avahi.
-    // On Linux/HAOS both Avahi and Zeroconf typically need the Avahi daemon; if the
-    // probe fails we still fall back but log that honestly.
+    // mDNS: prefer system Avahi when the daemon is on the host bus. On HAOS the
+    // Avahi bus name is often missing (`ServiceUnknown: not activatable`); the
+    // Zeroconf crate still needs Avahi on Linux and then "registers" while
+    // advertising nothing useful. Fall back to rs-matter's **BuiltinMdns**
+    // (UDP 5353, Matterbridge-style self-contained advertisement).
     enum MdnsChoice {
       Avahi(rs_matter_stack::matter::utils::zbus::Connection),
-      Zeroconf,
+      Builtin,
     }
 
     let mdns_choice = match futures_lite::future::block_on(Connection::system()) {
@@ -284,19 +286,17 @@ fn run_matter_stack(
         Err(probe_err) => {
           tracing::warn!(
             error = %probe_err,
-            "mDNS: Avahi D-Bus reachable but daemon probe failed; falling back to Zeroconf \
-             (on Linux/HAOS Zeroconf also typically needs the Avahi daemon — fix Avahi if discovery fails)"
+            "mDNS: Avahi not usable on host D-Bus; using BuiltinMdns (UDP 5353)"
           );
-          MdnsChoice::Zeroconf
+          MdnsChoice::Builtin
         }
       },
       Err(err) => {
         tracing::warn!(
           error = %err,
-          "mDNS: system D-Bus unavailable; using Zeroconf \
-           (on Linux/HAOS both Avahi and Zeroconf need the Avahi daemon)"
+          "mDNS: system D-Bus unavailable; using BuiltinMdns (UDP 5353)"
         );
-        MdnsChoice::Zeroconf
+        MdnsChoice::Builtin
       }
     };
 
@@ -322,12 +322,12 @@ fn run_matter_stack(
         ));
         futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
       }
-      MdnsChoice::Zeroconf => {
-        tracing::info!("mDNS: active backend = Zeroconf");
+      MdnsChoice::Builtin => {
+        tracing::info!("mDNS: active backend = BuiltinMdns (self-contained UDP 5353)");
         let matter = core::pin::pin!(stack.run_preex(
           edge_nal_std::Stack::new(),
           LanNetifs::new(mdns_interface),
-          ZeroconfMdns::new(),
+          BuiltinMdns::new(),
           &crypto,
           (plane.as_ref(), handler),
           kv,

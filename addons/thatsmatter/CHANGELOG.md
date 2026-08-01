@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+
+- When host Avahi is missing (typical HAOS), use built-in mDNS (UDP 5353) instead of Zeroconf, which cannot advertise without Avahi
+
 ## 0.2.2
 
 - Fix App crash on HAOS: build the bridge on Debian bookworm so glibc matches the runtime image (GLIBC_2.39 not found)
