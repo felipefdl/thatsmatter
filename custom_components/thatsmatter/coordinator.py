@@ -19,7 +19,7 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .bridge_client import BridgeClient, BridgeClientError
-from .const import COMMAND_POLL_INTERVAL, DOMAIN
+from .const import COMMAND_POLL_INTERVAL, DOMAIN, STATUS_POLL_INTERVAL
 from .helpers import ha_state_value, matter_level_to_ha_brightness
 from .models import Export
 from .store import ExportStore
@@ -84,11 +84,17 @@ class ThatsMatterRuntime:
             )
 
         if self.bridge_connected:
-            await self.async_push_catalog()
-            await self.async_refresh_status()
-            await self.async_refresh_pairing()
-            await self.async_push_all_states()
-            await self.async_show_pairing_notification()
+            try:
+                await self.async_push_catalog()
+                await self.async_refresh_status()
+                await self.async_refresh_pairing()
+                await self.async_push_all_states()
+                await self.async_show_pairing_notification()
+            except BridgeClientError as err:
+                # Loops below retry; a transient failure must not fail entry setup.
+                self.bridge_connected = False
+                self.last_error = str(err)
+                _LOGGER.warning("Initial bridge sync failed (%s); will keep retrying", err)
 
         self._subscribe_states()
         self._command_task = self.hass.async_create_background_task(
@@ -249,6 +255,10 @@ class ThatsMatterRuntime:
 
         @callback
         def _on_state(event: Event) -> None:
+            # Filter before creating a task; this runs for every state_changed in HA.
+            entity_id = event.data.get("entity_id")
+            if not entity_id or not self.store.data.find_by_entity(str(entity_id)):
+                return
             self.hass.async_create_task(self._async_handle_state_event(event))
 
         # Bus-wide listen so catalog growth does not require re-subscribe.
@@ -274,8 +284,14 @@ class ThatsMatterRuntime:
         while self._started:
             try:
                 if self.client is not None:
+                    was_connected = self.bridge_connected
                     commands = await self.client.take_commands()
                     self.bridge_connected = True
+                    self.last_error = None
+                    if not was_connected:
+                        # This loop polls faster than the status loop, so it is
+                        # usually the first to observe a reconnect.
+                        await self._async_on_reconnected()
                     for cmd in commands:
                         await self._async_execute_command(cmd)
             except asyncio.CancelledError:
@@ -286,6 +302,13 @@ class ThatsMatterRuntime:
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Command loop error")
             await asyncio.sleep(COMMAND_POLL_INTERVAL)
+
+    async def _async_on_reconnected(self) -> None:
+        """Bridge came (back) up: re-push catalog and entity states."""
+        _LOGGER.info(
+            "Bridge reachable at %s:%s; syncing catalog", self.host, self.port
+        )
+        await self._async_resync()
 
     async def _async_resync(self) -> None:
         """Re-push catalog and entity states after the bridge (re)connects."""
@@ -303,19 +326,14 @@ class ThatsMatterRuntime:
                     was_connected = self.bridge_connected
                     await self.async_refresh_status()
                     if self.bridge_connected and not was_connected:
-                        _LOGGER.info(
-                            "Bridge reachable at %s:%s; syncing catalog",
-                            self.host,
-                            self.port,
-                        )
-                        await self._async_resync()
+                        await self._async_on_reconnected()
                     await self.async_refresh_pairing()
                     await self.async_show_pairing_notification()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 _LOGGER.debug("Status loop error", exc_info=True)
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(STATUS_POLL_INTERVAL)
 
     async def _async_execute_command(self, cmd: dict[str, Any]) -> None:
         export_id = str(cmd.get("export_id", ""))

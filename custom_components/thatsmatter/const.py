@@ -19,6 +19,9 @@ STORAGE_VERSION = 1
 # How often the component polls the bridge for Matter -> HA commands.
 COMMAND_POLL_INTERVAL = 0.5
 
+# How often the component refreshes bridge status and pairing material.
+STATUS_POLL_INTERVAL = 5.0
+
 # Service names (domain is DOMAIN).
 SERVICE_ADD_EXPORT = "add_export"
 SERVICE_UPDATE_EXPORT = "update_export"
