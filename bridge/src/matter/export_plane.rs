@@ -41,8 +41,8 @@ use uuid::Uuid;
 use super::clusters::boolean_state::{self as bool_state_cluster};
 use super::clusters::occupancy::{self as occupancy_cluster};
 use super::clusters::window_covering::{
-  self as window_covering_cluster, CoverMotion, ha_cover_from_state, ha_position_to_percent100ths,
-  percent100ths_to_ha_position,
+  self as window_covering_cluster, CoverMotion, accept_mode_write, ha_cover_from_state, ha_position_to_percent100ths,
+  percent100ths_to_ha_position, validate_lift_percent100ths,
 };
 use super::device_types::{
   DEV_TYPE_CONTACT_SENSOR, DEV_TYPE_OCCUPANCY_SENSOR, DEV_TYPE_ON_OFF_PLUG_IN_UNIT, DEV_TYPE_WINDOW_COVERING,
@@ -897,8 +897,25 @@ impl AsyncHandler for ExportPlane {
     false
   }
 
-  // No `write`: the only writable attribute we advertise is `NodeLabel`, and the
-  // catalog owns names, so the default `AttributeNotFound` is the right answer.
+  async fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+    let (endpoint, cluster) = (ctx.attr().endpoint_id, ctx.attr().cluster_id);
+
+    let state = self.snapshot();
+    let Some(slot) = state.slot_at(endpoint) else {
+      return Err(ErrorCode::EndpointNotFound.into());
+    };
+
+    // Window Covering `Mode` is the only writable functional attribute we
+    // advertise. Bridged `NodeLabel` stays catalog-owned → AttributeNotFound.
+    if cluster == WINDOW_COVERING_CLUSTER.id && matches!(slot.kind, SlotKind::Cover { .. }) {
+      return Handler::write(
+        &window_covering_cluster::HandlerAdaptor(SlotWindowCoveringHandler { plane: self, slot }),
+        ctx,
+      );
+    }
+
+    Err(ErrorCode::AttributeNotFound.into())
+  }
 
   async fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
     let (endpoint, cluster) = (ctx.attr().endpoint_id, ctx.attr().cluster_id);
@@ -1229,6 +1246,35 @@ impl SlotWindowCoveringHandler<'_> {
     ctx.notify_own_attr_changed(window_covering_cluster::AttributeId::OperationalStatus as AttrId);
     Ok(())
   }
+
+  /// Mode write body (no WriteContext). Empty only; non-empty → ConstraintError.
+  fn apply_mode_write(&self, value: rs_matter::dm::clusters::decl::window_covering::Mode) -> Result<(), Error> {
+    accept_mode_write(value).map_err(Into::into)
+  }
+
+  /// Open / close / stop command body (no InvokeContext).
+  fn apply_motion_command(&self, kind: CommandKind) -> Result<(), Error> {
+    if !self.plane.apply_controller_cover(self.slot.matter_endpoint, kind, None) {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    Ok(())
+  }
+
+  /// GoToLiftPercentage body: range check, map to HA scale, enqueue CoverPosition.
+  ///
+  /// Values outside `0..=10000` return ConstraintError with no slot mutation and
+  /// no queued command.
+  fn apply_go_to_lift_percentage(&self, percent100ths: u16) -> Result<(), Error> {
+    let percent = validate_lift_percent100ths(percent100ths).map_err(Error::from)?;
+    let ha_position = percent100ths_to_ha_position(percent);
+    if !self
+      .plane
+      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverPosition, Some(ha_position))
+    {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    Ok(())
+  }
 }
 
 impl window_covering_cluster::ClusterHandler for SlotWindowCoveringHandler<'_> {
@@ -1286,39 +1332,23 @@ impl window_covering_cluster::ClusterHandler for SlotWindowCoveringHandler<'_> {
   fn set_mode(
     &self,
     _ctx: impl WriteContext,
-    _value: rs_matter::dm::clusters::decl::window_covering::Mode,
+    value: rs_matter::dm::clusters::decl::window_covering::Mode,
   ) -> Result<(), Error> {
-    // Advertised but not configurable from a bridge — ignore writes.
-    Ok(())
+    self.apply_mode_write(value)
   }
 
   fn handle_up_or_open(&self, ctx: impl InvokeContext) -> Result<(), Error> {
-    if !self
-      .plane
-      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverOpen, None)
-    {
-      return Err(ErrorCode::EndpointNotFound.into());
-    }
+    self.apply_motion_command(CommandKind::CoverOpen)?;
     self.notify_position_attrs(ctx)
   }
 
   fn handle_down_or_close(&self, ctx: impl InvokeContext) -> Result<(), Error> {
-    if !self
-      .plane
-      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverClose, None)
-    {
-      return Err(ErrorCode::EndpointNotFound.into());
-    }
+    self.apply_motion_command(CommandKind::CoverClose)?;
     self.notify_position_attrs(ctx)
   }
 
   fn handle_stop_motion(&self, ctx: impl InvokeContext) -> Result<(), Error> {
-    if !self
-      .plane
-      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverStop, None)
-    {
-      return Err(ErrorCode::EndpointNotFound.into());
-    }
+    self.apply_motion_command(CommandKind::CoverStop)?;
     self.notify_position_attrs(ctx)
   }
 
@@ -1328,13 +1358,7 @@ impl window_covering_cluster::ClusterHandler for SlotWindowCoveringHandler<'_> {
     request: rs_matter::dm::clusters::decl::window_covering::GoToLiftPercentageRequest<'_>,
   ) -> Result<(), Error> {
     let percent = request.lift_percent_100_ths_value()?;
-    let ha_position = percent100ths_to_ha_position(percent);
-    if !self
-      .plane
-      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverPosition, Some(ha_position))
-    {
-      return Err(ErrorCode::EndpointNotFound.into());
-    }
+    self.apply_go_to_lift_percentage(percent)?;
     self.notify_position_attrs(ctx)
   }
 
@@ -1840,40 +1864,112 @@ mod tests {
     assert_eq!(plane.cover_target_for(id), Some(37), "stopped: current == target");
   }
 
+  /// Handler-level: GoToLiftPercentage 6300 → CoverPosition { position: 37 }.
   #[test]
-  fn cover_controller_commands_enqueue_correct_kinds() {
+  fn cover_handler_go_to_lift_6300_enqueues_position_37() {
     let plane = ExportPlane::new();
     let id = Uuid::new_v4();
     plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+    let state = plane.snapshot();
+    let handler = SlotWindowCoveringHandler {
+      plane: &plane,
+      slot: state.slot_at(2).expect("cover endpoint"),
+    };
 
-    assert!(plane.apply_controller_cover(2, CommandKind::CoverOpen, None));
-    assert!(plane.apply_controller_cover(2, CommandKind::CoverClose, None));
-    assert!(plane.apply_controller_cover(2, CommandKind::CoverStop, None));
-    assert!(plane.apply_controller_cover(2, CommandKind::CoverPosition, Some(42)));
+    handler.apply_go_to_lift_percentage(6300).expect("valid percent100ths");
 
     let cmds = plane.take_commands();
-    assert_eq!(cmds.len(), 4);
-    assert_eq!(cmds[0].kind, CommandKind::CoverOpen);
-    assert_eq!(cmds[1].kind, CommandKind::CoverClose);
-    assert_eq!(cmds[2].kind, CommandKind::CoverStop);
-    assert_eq!(cmds[3].kind, CommandKind::CoverPosition);
-    assert_eq!(cmds[3].position, Some(42));
-    assert_eq!(plane.cover_target_for(id), Some(42));
-  }
-
-  #[test]
-  fn cover_go_to_lift_percentage_maps_matter_to_ha_scale() {
-    let plane = ExportPlane::new();
-    let id = Uuid::new_v4();
-    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
-
-    // Matter 6300 (37% closed from open) → HA position 37.
-    let ha = percent100ths_to_ha_position(6300);
-    assert_eq!(ha, 37);
-    assert!(plane.apply_controller_cover(2, CommandKind::CoverPosition, Some(ha)));
-    let cmds = plane.take_commands();
+    assert_eq!(cmds.len(), 1);
     assert_eq!(cmds[0].kind, CommandKind::CoverPosition);
     assert_eq!(cmds[0].position, Some(37));
+    assert_eq!(cmds[0].export_id, id);
+    assert_eq!(plane.cover_target_for(id), Some(37));
+  }
+
+  /// Handler-level: percent100ths 10001 → ConstraintError, no queue, no mutation.
+  #[test]
+  fn cover_handler_go_to_lift_10001_is_constraint_error_and_queues_nothing() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+    let target_before = plane.cover_target_for(id).unwrap();
+    let pos_before = plane.cover_position_for(id).unwrap();
+
+    let state = plane.snapshot();
+    let handler = SlotWindowCoveringHandler {
+      plane: &plane,
+      slot: state.slot_at(2).expect("cover endpoint"),
+    };
+
+    let err = handler.apply_go_to_lift_percentage(10_001).expect_err("out of range");
+    assert_eq!(err.code(), ErrorCode::ConstraintError);
+    assert!(
+      plane.take_commands().is_empty(),
+      "invalid GoToLiftPercentage must not enqueue"
+    );
+    assert_eq!(plane.cover_target_for(id), Some(target_before));
+    assert_eq!(plane.cover_position_for(id), Some(pos_before));
+  }
+
+  /// Handler-level: Open / Close / Stop each enqueue exactly one correct command.
+  #[test]
+  fn cover_handler_open_close_stop_each_enqueue_one_command() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+    let state = plane.snapshot();
+    let handler = SlotWindowCoveringHandler {
+      plane: &plane,
+      slot: state.slot_at(2).expect("cover endpoint"),
+    };
+
+    handler.apply_motion_command(CommandKind::CoverOpen).expect("open");
+    let cmds = plane.take_commands();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].kind, CommandKind::CoverOpen);
+    assert_eq!(cmds[0].export_id, id);
+    assert_eq!(cmds[0].position, None);
+
+    handler.apply_motion_command(CommandKind::CoverClose).expect("close");
+    let cmds = plane.take_commands();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].kind, CommandKind::CoverClose);
+
+    handler.apply_motion_command(CommandKind::CoverStop).expect("stop");
+    let cmds = plane.take_commands();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].kind, CommandKind::CoverStop);
+  }
+
+  /// Handler-level Mode write: empty accepted; any non-empty bit → ConstraintError.
+  #[test]
+  fn cover_handler_mode_write_empty_ok_non_empty_rejected() {
+    use rs_matter::dm::clusters::decl::window_covering::Mode;
+
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+    let state = plane.snapshot();
+    let handler = SlotWindowCoveringHandler {
+      plane: &plane,
+      slot: state.slot_at(2).expect("cover endpoint"),
+    };
+
+    handler
+      .apply_mode_write(Mode::empty())
+      .expect("empty Mode is a no-op success");
+    assert!(plane.take_commands().is_empty());
+
+    let err = handler
+      .apply_mode_write(Mode::MOTOR_DIRECTION_REVERSED)
+      .expect_err("unsupported Mode bits");
+    assert_eq!(err.code(), ErrorCode::ConstraintError);
+
+    let err = handler
+      .apply_mode_write(Mode::CALIBRATION_MODE | Mode::MAINTENANCE_MODE)
+      .expect_err("any non-empty Mode");
+    assert_eq!(err.code(), ErrorCode::ConstraintError);
+    assert!(plane.take_commands().is_empty());
   }
 
   #[test]

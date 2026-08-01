@@ -13,6 +13,7 @@ use rs_matter::dm::clusters::decl::window_covering::{
 
 use rs_matter::dm::Cluster;
 pub use rs_matter::dm::clusters::decl::window_covering::AttributeId;
+use rs_matter::error::ErrorCode;
 use rs_matter::with;
 
 use crate::catalog::HaStateValue;
@@ -41,10 +42,26 @@ pub fn ha_position_to_percent100ths(ha_position: u8) -> u16 {
 }
 
 /// Matter percent100ths → HA position (0 = closed, 100 = open).
+///
+/// Caller must pass a value in `0..=10000` (e.g. after [`validate_lift_percent100ths`]).
+/// Values above 10000 are treated as fully closed so a defensive path never panics.
 #[inline]
 pub fn percent100ths_to_ha_position(percent100ths: u16) -> u8 {
   let p = percent100ths.min(10_000);
   ((10_000 - p) / 100) as u8
+}
+
+/// Spec range for `GoToLiftPercentage.lift_percent_100_ths_value` (percent100ths).
+///
+/// Out of range returns `ConstraintError` so the command path can reject with no
+/// state mutation and no queued HA command.
+#[inline]
+pub fn validate_lift_percent100ths(percent100ths: u16) -> Result<u16, ErrorCode> {
+  if percent100ths > 10_000 {
+    Err(ErrorCode::ConstraintError)
+  } else {
+    Ok(percent100ths)
+  }
 }
 
 /// ConfigStatus for a position-aware lift covering that is online.
@@ -81,10 +98,23 @@ pub fn end_product_type(is_garage: bool) -> EndProductType {
   }
 }
 
-/// Mode is mandatory and writable; we advertise empty and ignore writes.
+/// Mode is mandatory and writable. Slot shape has no mode state: always empty.
 #[inline]
 pub fn mode() -> Mode {
   Mode::empty()
+}
+
+/// Accept empty Mode writes; reject any non-empty bit set.
+///
+/// We do not store Mode. Succeeding while discarding bits would lie to the
+/// controller, so unsupported bits return `ConstraintError`.
+#[inline]
+pub fn accept_mode_write(value: Mode) -> Result<(), ErrorCode> {
+  if value.is_empty() {
+    Ok(())
+  } else {
+    Err(ErrorCode::ConstraintError)
+  }
 }
 
 /// Motion inferred from the HA cover entity state string.
@@ -160,9 +190,29 @@ mod tests {
   }
 
   #[test]
-  fn clamps_out_of_range() {
+  fn ha_position_clamps_above_100() {
     assert_eq!(ha_position_to_percent100ths(200), 0);
-    assert_eq!(percent100ths_to_ha_position(20_000), 0);
+  }
+
+  #[test]
+  fn lift_percent100ths_range_is_0_to_10000() {
+    assert_eq!(validate_lift_percent100ths(0), Ok(0));
+    assert_eq!(validate_lift_percent100ths(6300), Ok(6300));
+    assert_eq!(validate_lift_percent100ths(10_000), Ok(10_000));
+    assert_eq!(validate_lift_percent100ths(10_001), Err(ErrorCode::ConstraintError));
+  }
+
+  #[test]
+  fn mode_write_accepts_empty_rejects_bits() {
+    assert_eq!(accept_mode_write(Mode::empty()), Ok(()));
+    assert_eq!(
+      accept_mode_write(Mode::MOTOR_DIRECTION_REVERSED),
+      Err(ErrorCode::ConstraintError)
+    );
+    assert_eq!(
+      accept_mode_write(Mode::CALIBRATION_MODE | Mode::LED_FEEDBACK),
+      Err(ErrorCode::ConstraintError)
+    );
   }
 
   #[test]
