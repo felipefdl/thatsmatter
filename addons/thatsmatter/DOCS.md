@@ -19,6 +19,7 @@ Full guide: https://github.com/felipefdl/thatsmatter/blob/main/docs/haos-install
 | Listen port | 18465 | Integration IPC |
 | Matter backend | rs_matter | Use `dev` only for offline IPC tests |
 | Log level | info | Bridge logs |
+| LAN interface | _(empty)_ | Optional host interface name (`eth0`, `enp1s0`, `wlan0`). Empty = auto-select like Matterbridge (skips Docker/hassio faces). Set when multiple NICs break HomeKit/controller discovery. |
 
 ## Pairing and devices
 
@@ -26,6 +27,13 @@ Use the integration **Configure** menu (not YAML):
 
 - **Add devices to export**
 - **Pair with other apps** (opens the pairing window and shows setup code + QR on the device page)
+
+### Multi-NIC / HomeKit tips
+
+1. **Stop Matterbridge** (or any other Matter accessory on UDP **5540**) before pairing ThatsMatter on the same host.
+2. Prefer **Avahi** on the host (this App has `host_dbus` and uses system Avahi when available).
+3. If controllers never see the bridge, set **LAN interface** to your real Ethernet/Wi‑Fi name and **restart** the App. Check logs for `LAN netif inventory` / `selected Matter LAN interface`.
+4. Do **not** keep re-opening the pairing window while it is already open — the bridge treats that as a no-op so the stack window is not thrashed.
 
 ### Multi-admin pairing
 

@@ -77,3 +77,4 @@ HA_SSH=root@homeassistant.local ./scripts/install-haos.sh
 - Pairing uses CSA **test** credentials (uncertified prompts are normal)
 - One Matter OnOff endpoint is bound to the primary enabled OnOff export
 - Controllers must share the LAN with HA (mDNS / IPv6)
+- On multi-NIC hosts, set App option **LAN interface** (e.g. `eth0`) if HomeKit or other controllers cannot find the bridge; empty auto-selects the best real face (skips Docker/hassio). Stop Matterbridge before pairing (UDP 5540).

@@ -21,12 +21,22 @@ async-io = "2"
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+edge-nal = "0.7"
 edge-nal-std = "0.7"
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }
 futures-lite = "2"
 parking_lot = "0.12"
 rand = "0.8"
-rs-matter = { version = "0.2", default-features = false, features = ["os", "log", "zeroconf", "rustcrypto"] }
+# `zbus` enables Avahi mDNS (preferred on Linux/HAOS). Do not enable `zbus` on
+# `rs-matter-stack`: its bluez GATT path is gated only on `zbus` and fails to
+# compile on non-Linux hosts (stack Mdns adapter is implemented in-tree).
+rs-matter = { version = "0.2", default-features = false, features = [
+  "os",
+  "log",
+  "zeroconf",
+  "rustcrypto",
+  "zbus",
+] }
 # `max-subscriptions-8`: the default of 3 is exhausted by HA + a second ecosystem + a debug tool.
 rs-matter-stack = { version = "0.1", default-features = false, features = [
   "os",

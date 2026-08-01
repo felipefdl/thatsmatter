@@ -10,6 +10,10 @@
 //! window at startup only when no fabrics exist, and does not expose a
 //! read-only probe. Open/close from IPC is executed on the stack thread via a
 //! request mailbox in the plane `run()` loop.
+//!
+//! Networking: [`LanNetifs`] exposes a single Matterbridge-style LAN face so
+//! multi-NIC HAOS hosts do not bind Docker/hassio virtual interfaces. mDNS
+//! prefers system Avahi (D-Bus) and falls back to Zeroconf.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +27,7 @@ use uuid::Uuid;
 use super::backend::{MatterBackend, clamp_pairing_timeout};
 use super::commissioning::CommissioningMaterial;
 use super::export_plane::{BridgedEndpointMatcher, ExportPlane};
+use super::lan_netif::LanNetifs;
 use super::pairing::{basic_comm_data, pairing_material_for};
 use crate::catalog::{CommandRequest, Export, HaStateValue, PairingMaterial};
 use crate::config::BackendKind;
@@ -30,6 +35,8 @@ use crate::config::BackendKind;
 /// Production Matter backend: commissionable IP bridge.
 pub struct RsMatterBackend {
   data_dir: PathBuf,
+  /// Optional LAN interface pin (`eth0`, `enp1s0`, …); `None` = auto-select.
+  mdns_interface: Option<String>,
   /// Bridged endpoint table, shared with the Matter stack thread.
   plane: Arc<ExportPlane>,
   running: AtomicBool,
@@ -41,11 +48,13 @@ pub struct RsMatterBackend {
 }
 
 impl RsMatterBackend {
-  pub fn new(data_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+  pub fn new(data_dir: impl Into<PathBuf>, mdns_interface: Option<String>) -> anyhow::Result<Self> {
     let data_dir = data_dir.into();
     let commissioning = CommissioningMaterial::load_or_generate(&data_dir)?;
+    let mdns_interface = mdns_interface.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Ok(Self {
       data_dir,
+      mdns_interface,
       plane: Arc::new(ExportPlane::new()),
       running: AtomicBool::new(false),
       error: Mutex::new(None),
@@ -59,12 +68,13 @@ impl RsMatterBackend {
     let data_dir = self.data_dir.clone();
     let commissioning = self.commissioning;
     let plane = Arc::clone(&self.plane);
+    let mdns_interface = self.mdns_interface.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handle = thread::Builder::new()
       .name("thatsmatter-matter".into())
       .spawn(move || {
-        if let Err(err) = run_matter_stack(data_dir, commissioning, plane, ready_tx) {
+        if let Err(err) = run_matter_stack(data_dir, commissioning, plane, mdns_interface, ready_tx) {
           tracing::error!(error = %err, "Matter stack thread exited with error");
         }
       })?;
@@ -87,10 +97,38 @@ impl RsMatterBackend {
   }
 }
 
+/// Thin stack `Mdns` adapter around `rs-matter`'s Avahi backend.
+///
+/// Implemented here so we can enable `zbus` on `rs-matter` without also enabling
+/// `rs-matter-stack`'s `zbus` feature (which pulls a Linux-only bluez path).
+struct AvahiMdnsService {
+  inner: rs_matter_stack::matter::transport::network::mdns::avahi::AvahiMdns,
+}
+
+impl rs_matter_stack::mdns::Mdns for AvahiMdnsService {
+  async fn run<C, U>(
+    &mut self,
+    matter: &rs_matter_stack::matter::Matter<'_>,
+    _crypto: C,
+    _udp: U,
+    _mac: &[u8],
+    _ipv4: core::net::Ipv4Addr,
+    _ipv6: core::net::Ipv6Addr,
+    _interface: u32,
+  ) -> Result<(), rs_matter_stack::matter::error::Error>
+  where
+    C: rs_matter_stack::matter::crypto::Crypto,
+    U: edge_nal::UdpBind,
+  {
+    self.inner.run(matter).await
+  }
+}
+
 fn run_matter_stack(
   data_dir: PathBuf,
   commissioning: CommissioningMaterial,
   plane: Arc<ExportPlane>,
+  mdns_interface: Option<String>,
   ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
   use core::mem::MaybeUninit;
@@ -99,10 +137,11 @@ fn run_matter_stack(
   use rs_matter_stack::matter::crypto::default_crypto;
   use rs_matter_stack::matter::dm::EmptyHandler;
   use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
-  use rs_matter_stack::matter::dm::networks::unix::UnixNetifs;
   use rs_matter_stack::matter::persist::DirKvBlobStore;
+  use rs_matter_stack::matter::transport::network::mdns::avahi::AvahiMdns;
   use rs_matter_stack::matter::transport::network::mdns::zeroconf::ZeroconfMdns;
   use rs_matter_stack::matter::utils::init::InitMaybeUninit;
+  use rs_matter_stack::matter::utils::zbus::Connection;
 
   const BUMP_SIZE: usize = 23500;
 
@@ -143,19 +182,47 @@ fn run_matter_stack(
       .matter()
       .print_standard_qr_text(rs_matter_stack::matter::pairing::DiscoveryCapabilities::IP);
 
+    // Matterbridge-style LAN filter: single best real face (or pin).
+    let lan = LanNetifs::new(mdns_interface.clone());
+    lan.log_inventory();
+
     let _ = ready_tx.send(Ok(()));
 
-    let matter = core::pin::pin!(stack.run_preex(
-      edge_nal_std::Stack::new(),
-      UnixNetifs,
-      ZeroconfMdns::new(),
-      &crypto,
-      (plane.as_ref(), handler),
-      kv,
-      (),
-    ));
-
-    futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+    // Prefer system Avahi (ignores per-iface MAC/IPv4; multi-homes via the daemon).
+    // Fall back to Zeroconf when D-Bus/Avahi is unavailable (e.g. macOS dev).
+    match futures_lite::future::block_on(Connection::system()) {
+      Ok(conn) => {
+        tracing::info!("mDNS: using Avahi via system D-Bus");
+        let matter = core::pin::pin!(stack.run_preex(
+          edge_nal_std::Stack::new(),
+          LanNetifs::new(mdns_interface),
+          AvahiMdnsService {
+            inner: AvahiMdns::new(conn),
+          },
+          &crypto,
+          (plane.as_ref(), handler),
+          kv,
+          (),
+        ));
+        futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+      }
+      Err(err) => {
+        tracing::warn!(
+          error = %err,
+          "mDNS: Avahi system bus unavailable; falling back to Zeroconf"
+        );
+        let matter = core::pin::pin!(stack.run_preex(
+          edge_nal_std::Stack::new(),
+          LanNetifs::new(mdns_interface),
+          ZeroconfMdns::new(),
+          &crypto,
+          (plane.as_ref(), handler),
+          kv,
+          (),
+        ));
+        futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+      }
+    }
   })();
 
   if let Err(ref err) = result {
@@ -182,6 +249,7 @@ impl MatterBackend for RsMatterBackend {
       setup_code = %self.pairing.setup_code,
       pairing_open = self.plane.pairing_open(),
       fabrics = self.plane.commissioned_fabrics(),
+      mdns_interface = ?self.mdns_interface,
       "RsMatterBackend started (commissionable IP bridge)"
     );
     Ok(())

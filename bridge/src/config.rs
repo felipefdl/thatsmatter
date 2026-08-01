@@ -55,6 +55,10 @@ pub struct Config {
   /// Allow non-loopback `--listen` (Docker / LAN). Default rejects non-loopback.
   #[arg(long, env = "THATSMATTER_ALLOW_NON_LOOPBACK", default_value_t = false)]
   pub allow_non_loopback: bool,
+
+  /// LAN interface name for Matter / mDNS (e.g. `eth0`, `enp1s0`). Empty = auto-select.
+  #[arg(long, env = "THATSMATTER_MDNS_INTERFACE")]
+  pub mdns_interface: Option<String>,
 }
 
 impl Config {
@@ -78,51 +82,64 @@ mod tests {
   use super::*;
   use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-  #[test]
-  fn accepts_loopback_v4() {
-    let cfg = Config {
-      listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18465),
+  fn sample_cfg(listen: SocketAddr, allow_non_loopback: bool, backend: BackendKind) -> Config {
+    Config {
+      listen,
       data_dir: PathBuf::from("./data"),
       bridge_name: "ThatsMatter".into(),
-      matter_backend: BackendKind::Dev,
-      allow_non_loopback: false,
-    };
+      matter_backend: backend,
+      allow_non_loopback,
+      mdns_interface: None,
+    }
+  }
+
+  #[test]
+  fn accepts_loopback_v4() {
+    let cfg = sample_cfg(
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18465),
+      false,
+      BackendKind::Dev,
+    );
     assert!(cfg.ensure_loopback().is_ok());
   }
 
   #[test]
   fn accepts_loopback_v6() {
-    let cfg = Config {
-      listen: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 18465),
-      data_dir: PathBuf::from("./data"),
-      bridge_name: "ThatsMatter".into(),
-      matter_backend: BackendKind::Dev,
-      allow_non_loopback: false,
-    };
+    let cfg = sample_cfg(
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 18465),
+      false,
+      BackendKind::Dev,
+    );
     assert!(cfg.ensure_loopback().is_ok());
   }
 
   #[test]
   fn rejects_non_loopback() {
-    let cfg = Config {
-      listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18465),
-      data_dir: PathBuf::from("./data"),
-      bridge_name: "ThatsMatter".into(),
-      matter_backend: BackendKind::Dev,
-      allow_non_loopback: false,
-    };
+    let cfg = sample_cfg(
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18465),
+      false,
+      BackendKind::Dev,
+    );
     assert!(cfg.ensure_loopback().is_err());
   }
 
   #[test]
   fn allows_non_loopback_when_flag_set() {
-    let cfg = Config {
-      listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18465),
-      data_dir: PathBuf::from("./data"),
-      bridge_name: "ThatsMatter".into(),
-      matter_backend: BackendKind::RsMatter,
-      allow_non_loopback: true,
-    };
+    let cfg = sample_cfg(
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18465),
+      true,
+      BackendKind::RsMatter,
+    );
     assert!(cfg.ensure_loopback().is_ok());
+  }
+
+  #[test]
+  fn mdns_interface_defaults_to_none() {
+    let cfg = sample_cfg(
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18465),
+      false,
+      BackendKind::RsMatter,
+    );
+    assert_eq!(cfg.mdns_interface, None);
   }
 }

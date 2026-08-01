@@ -11,5 +11,11 @@ configuration:
   log_level:
     name: Log level
     description: Logging verbosity for the bridge process
+  mdns_interface:
+    name: LAN interface
+    description: >-
+      Network interface for Matter (e.g. eth0, enp1s0, wlan0). Leave empty to
+      auto-select the best real LAN face (skips Docker/hassio virtual interfaces).
+      Set this when multiple NICs cause commissioning to fail.
 network:
   18465/TCP: ThatsMatter integration control plane (HTTP JSON)
