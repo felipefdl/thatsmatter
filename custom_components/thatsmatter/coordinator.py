@@ -287,12 +287,28 @@ class ThatsMatterRuntime:
                 _LOGGER.exception("Command loop error")
             await asyncio.sleep(COMMAND_POLL_INTERVAL)
 
+    async def _async_resync(self) -> None:
+        """Re-push catalog and entity states after the bridge (re)connects."""
+        try:
+            await self.async_push_catalog()
+            await self.async_push_all_states()
+        except BridgeClientError:
+            return
+
     async def _status_loop(self) -> None:
         """Periodically refresh status and pairing material."""
         while self._started:
             try:
                 if self.client is not None:
+                    was_connected = self.bridge_connected
                     await self.async_refresh_status()
+                    if self.bridge_connected and not was_connected:
+                        _LOGGER.info(
+                            "Bridge reachable at %s:%s; syncing catalog",
+                            self.host,
+                            self.port,
+                        )
+                        await self._async_resync()
                     await self.async_refresh_pairing()
                     await self.async_show_pairing_notification()
             except asyncio.CancelledError:
