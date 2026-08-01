@@ -1,5 +1,5 @@
 name: ThatsMatter
-version: "0.1.0"
+version: "0.1.2"
 slug: thatsmatter
 description: >-
   Local Matter bridge for Home Assistant. Exposes selected entities to Matter
