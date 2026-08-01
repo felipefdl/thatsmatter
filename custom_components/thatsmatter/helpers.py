@@ -85,7 +85,7 @@ def default_type_for_entity(
         return "cover"
 
     if dom == "binary_sensor":
-        if dc in _CONTACT_CLASSES or dc == "door" or dc == "window":
+        if dc in _CONTACT_CLASSES:
             return "contact"
         if dc in _MOTION_CLASSES:
             return "motion"
