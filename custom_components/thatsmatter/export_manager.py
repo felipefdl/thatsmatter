@@ -9,7 +9,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 
-from .helpers import default_type_for_entity, domain_from_entity_id, is_supported_type
+from .helpers import (
+    default_type_for_entity,
+    domain_from_entity_id,
+    is_supported_type,
+    validate_export_fields,
+)
 from .models import Export
 from .store import ExportStore
 
@@ -103,6 +108,8 @@ async def async_add_entity_export(
     name: str | None = None,
     type_key: str | None = None,
     enabled: bool = True,
+    linked: dict[str, str] | None = None,
+    area_id: str | None = None,
 ) -> Export:
     """Create one export from an HA entity (UI-friendly defaults)."""
     runtime = get_runtime(hass)
@@ -117,15 +124,15 @@ async def async_add_entity_export(
 
     resolved_type = resolve_type(hass, entity_id, type_key)
     export_name = (name or "").strip() or friendly_name(hass, entity_id)
-    area_id = area_for_entity(hass, entity_id)
+    resolved_area = area_id if area_id is not None else area_for_entity(hass, entity_id)
 
     try:
         export = Export.new(
             name=export_name,
             type_key=resolved_type,
             primary_entity_id=entity_id,
-            linked={},
-            area_id=area_id,
+            linked=dict(linked or {}),
+            area_id=resolved_area,
             enabled=enabled,
         )
     except ValueError as err:
@@ -169,27 +176,47 @@ async def async_update_export_fields(
     name: str | None = None,
     type_key: str | None = None,
     enabled: bool | None = None,
+    primary_entity_id: str | None = None,
+    linked: dict[str, str] | None = None,
+    area_id: str | None | object = ...,
 ) -> Export:
-    """Patch export presentation fields."""
+    """Patch export fields (only provided ones; area_id=None clears the area)."""
     runtime = get_runtime(hass)
     store: ExportStore = runtime.store
     existing = store.get(export_id)
     if existing is None:
         raise HomeAssistantError("Export not found")
 
-    new_name = name if name is not None else existing.name
+    new_name = (name if name is not None else existing.name).strip()
     new_type = type_key if type_key is not None else existing.type
     new_enabled = enabled if enabled is not None else existing.enabled
-    if not is_supported_type(new_type):
-        raise HomeAssistantError(f"Unsupported type: {new_type}")
+    new_primary = (
+        primary_entity_id if primary_entity_id is not None else existing.primary_entity_id
+    )
+    new_linked = dict(linked) if linked is not None else dict(existing.linked)
+    new_area = existing.area_id if area_id is ... else area_id
+
+    errors = validate_export_fields(
+        name=new_name,
+        type_key=new_type,
+        primary_entity_id=new_primary,
+        linked=new_linked,
+    )
+    if errors:
+        raise HomeAssistantError("; ".join(errors))
+    for other in store.list_exports():
+        if other.export_id != export_id and other.primary_entity_id == new_primary:
+            raise HomeAssistantError(
+                f"{new_primary} is already exported as '{other.name}'."
+            )
 
     updated = Export(
         export_id=existing.export_id,
-        name=new_name.strip(),
+        name=new_name,
         type=new_type,
-        primary_entity_id=existing.primary_entity_id,
-        linked=dict(existing.linked),
-        area_id=existing.area_id,
+        primary_entity_id=new_primary,
+        linked=new_linked,
+        area_id=new_area,
         enabled=new_enabled,
         endpoint_id=existing.endpoint_id,
     )
@@ -219,7 +246,8 @@ async def async_reset_export_name(hass: HomeAssistant, export_id: str) -> Export
     existing = store.get(export_id)
     if existing is None:
         raise HomeAssistantError("Export not found")
-    existing.name = friendly_name(hass, existing.primary_entity_id)
+    # Clamp to the protocol name limit; long HA friendly names must not poison sync.
+    existing.name = friendly_name(hass, existing.primary_entity_id)[:64]
     await store.async_upsert(existing)
     await async_push_catalog(runtime)
     runtime.notify_listeners()

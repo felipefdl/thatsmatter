@@ -90,6 +90,8 @@ async def async_add_export(hass: HomeAssistant, call: ServiceCall) -> None:
         name=call.data.get(ATTR_NAME),
         type_key=call.data.get(ATTR_TYPE),
         enabled=call.data.get(ATTR_ENABLED, True),
+        linked=call.data.get(ATTR_LINKED),
+        area_id=call.data.get(ATTR_AREA_ID),
     )
 
 
@@ -102,6 +104,12 @@ async def async_update_export(hass: HomeAssistant, call: ServiceCall) -> None:
         kwargs["type_key"] = call.data[ATTR_TYPE]
     if ATTR_ENABLED in call.data:
         kwargs["enabled"] = call.data[ATTR_ENABLED]
+    if ATTR_PRIMARY_ENTITY_ID in call.data:
+        kwargs["primary_entity_id"] = call.data[ATTR_PRIMARY_ENTITY_ID]
+    if ATTR_LINKED in call.data:
+        kwargs["linked"] = call.data[ATTR_LINKED]
+    if ATTR_AREA_ID in call.data:
+        kwargs["area_id"] = call.data[ATTR_AREA_ID]
     await async_update_export_fields(hass, call.data[ATTR_EXPORT_ID], **kwargs)
 
 
