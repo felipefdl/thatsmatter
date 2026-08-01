@@ -10,13 +10,10 @@ use rs_matter::dm::DeviceType;
 pub const DEV_TYPE_ON_OFF_PLUG_IN_UNIT: DeviceType = DeviceType { dtype: 0x010A, drev: 3 };
 
 /// Contact Sensor (0x0015): open/closed reported through Boolean State.
-#[allow(dead_code)]
 pub const DEV_TYPE_CONTACT_SENSOR: DeviceType = DeviceType { dtype: 0x0015, drev: 2 };
 
 /// Occupancy Sensor (0x0107): motion/presence reported through Occupancy Sensing.
-#[allow(dead_code)]
 pub const DEV_TYPE_OCCUPANCY_SENSOR: DeviceType = DeviceType { dtype: 0x0107, drev: 4 };
 
 /// Window Covering (0x0202): blinds/shades driven through Window Covering.
-#[allow(dead_code)]
 pub const DEV_TYPE_WINDOW_COVERING: DeviceType = DeviceType { dtype: 0x0202, drev: 5 };

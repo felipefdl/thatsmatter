@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 use rs_matter::dm::clusters::decl::bridged_device_basic_information as bridged_info;
@@ -32,15 +32,23 @@ use rs_matter::dm::{
   WriteContext,
 };
 use rs_matter::error::{Error, ErrorCode};
-use rs_matter::tlv::{TLVBuilderParent, Utf8Str, Utf8StrBuilder};
+use rs_matter::tlv::{Nullable, TLVBuilderParent, Utf8Str, Utf8StrBuilder};
 use rs_matter::with;
 use rs_matter_stack::eth::EthMatterStack;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use super::device_types::DEV_TYPE_ON_OFF_PLUG_IN_UNIT;
-use super::on_off_map::{is_matter_on_off_export, on_off_command, on_off_from_states};
-use crate::catalog::{CommandRequest, DeviceType, Export, HaStateValue};
+use super::clusters::boolean_state::{self as bool_state_cluster};
+use super::clusters::occupancy::{self as occupancy_cluster};
+use super::clusters::window_covering::{
+  self as window_covering_cluster, CoverMotion, ha_cover_from_state, ha_position_to_percent100ths,
+  percent100ths_to_ha_position,
+};
+use super::device_types::{
+  DEV_TYPE_CONTACT_SENSOR, DEV_TYPE_OCCUPANCY_SENSOR, DEV_TYPE_ON_OFF_PLUG_IN_UNIT, DEV_TYPE_WINDOW_COVERING,
+};
+use super::on_off_map::{ha_state_is_on, is_matter_bridged_export, on_off_command, on_off_from_states};
+use crate::catalog::{CommandKind, CommandRequest, DeviceType, Export, HaStateValue};
 
 /// Matter endpoint hosting the aggregator (root is 0, bridged devices start at 2).
 pub const AGGREGATOR_ENDPOINT_ID: EndptId = 1;
@@ -49,7 +57,8 @@ pub const AGGREGATOR_ENDPOINT_ID: EndptId = 1;
 const NODE_LABEL_MAX_BYTES: usize = 32;
 
 /// Pending-report bits drained by the stack thread on every wake.
-const REPORT_ON_OFF: u32 = 1 << 0;
+/// Functional cluster attributes (OnOff / BooleanState / Occupancy / WindowCovering).
+const REPORT_FUNCTIONAL: u32 = 1 << 0;
 const REPORT_NODE_LABEL: u32 = 1 << 1;
 /// Bridged-endpoint Descriptor (e.g. DeviceTypeList) after a surface change.
 const REPORT_DESCRIPTOR: u32 = 1 << 2;
@@ -72,18 +81,38 @@ const ON_OFF_CLUSTER: Cluster<'static> = on_off_decl::FULL_CLUSTER
   ))
   .with_events(with!());
 
+const BOOLEAN_STATE_CLUSTER: Cluster<'static> = bool_state_cluster::CLUSTER;
+const OCCUPANCY_CLUSTER: Cluster<'static> = occupancy_cluster::CLUSTER;
+const WINDOW_COVERING_CLUSTER: Cluster<'static> = window_covering_cluster::CLUSTER;
+
 static AGGREGATOR_DEVICE_TYPES: [MatterDeviceType; 1] = [DEV_TYPE_AGGREGATOR];
 static AGGREGATOR_CLUSTERS: [Cluster<'static>; 1] = [DESC_CLUSTER];
 static BRIDGED_ON_OFF_CLUSTERS: [Cluster<'static>; 3] = [DESC_CLUSTER, BRIDGED_INFO_CLUSTER, ON_OFF_CLUSTER];
+static BRIDGED_CONTACT_CLUSTERS: [Cluster<'static>; 3] = [DESC_CLUSTER, BRIDGED_INFO_CLUSTER, BOOLEAN_STATE_CLUSTER];
+static BRIDGED_MOTION_CLUSTERS: [Cluster<'static>; 3] = [DESC_CLUSTER, BRIDGED_INFO_CLUSTER, OCCUPANCY_CLUSTER];
+static BRIDGED_COVER_CLUSTERS: [Cluster<'static>; 3] = [DESC_CLUSTER, BRIDGED_INFO_CLUSTER, WINDOW_COVERING_CLUSTER];
 // Concrete device type first, `Bridged Node` second, matching upstream's bridge example.
 static ON_OFF_LIGHT_DEVICE_TYPES: [MatterDeviceType; 2] = [DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_BRIDGED_NODE];
 static ON_OFF_PLUG_DEVICE_TYPES: [MatterDeviceType; 2] = [DEV_TYPE_ON_OFF_PLUG_IN_UNIT, DEV_TYPE_BRIDGED_NODE];
+static CONTACT_DEVICE_TYPES: [MatterDeviceType; 2] = [DEV_TYPE_CONTACT_SENSOR, DEV_TYPE_BRIDGED_NODE];
+static MOTION_DEVICE_TYPES: [MatterDeviceType; 2] = [DEV_TYPE_OCCUPANCY_SENSOR, DEV_TYPE_BRIDGED_NODE];
+static COVER_DEVICE_TYPES: [MatterDeviceType; 2] = [DEV_TYPE_WINDOW_COVERING, DEV_TYPE_BRIDGED_NODE];
 
 /// Functional surface a slot exposes to controllers.
 #[derive(Debug)]
 pub enum SlotKind {
   /// On/off-capable export (light, switch, plug, outlet).
   OnOff { on: AtomicBool },
+  /// Cover / garage: HA-scale position 0–100 (100 = open), target, and in-motion flag.
+  Cover {
+    position: AtomicU8,
+    target: AtomicU8,
+    moving: AtomicBool,
+  },
+  /// Contact sensor: Matter `StateValue` true = closed.
+  Contact { closed: AtomicBool },
+  /// Motion / occupancy sensor.
+  Motion { occupied: AtomicBool },
 }
 
 /// One bridged endpoint: a catalog export plus its Matter-side state.
@@ -117,6 +146,47 @@ impl ExportSlot {
   pub fn on(&self) -> bool {
     match &self.kind {
       SlotKind::OnOff { on } => on.load(Ordering::SeqCst),
+      _ => false,
+    }
+  }
+
+  /// Contact: Matter `StateValue` (true = closed).
+  pub fn contact_closed(&self) -> bool {
+    match &self.kind {
+      SlotKind::Contact { closed } => closed.load(Ordering::SeqCst),
+      _ => false,
+    }
+  }
+
+  /// Motion: occupied bit.
+  pub fn motion_occupied(&self) -> bool {
+    match &self.kind {
+      SlotKind::Motion { occupied } => occupied.load(Ordering::SeqCst),
+      _ => false,
+    }
+  }
+
+  /// Cover HA-scale position (0 = closed, 100 = open).
+  pub fn cover_position(&self) -> u8 {
+    match &self.kind {
+      SlotKind::Cover { position, .. } => position.load(Ordering::SeqCst),
+      _ => 0,
+    }
+  }
+
+  /// Cover HA-scale target position.
+  pub fn cover_target(&self) -> u8 {
+    match &self.kind {
+      SlotKind::Cover { target, .. } => target.load(Ordering::SeqCst),
+      _ => 0,
+    }
+  }
+
+  /// Whether the cover reports in-motion.
+  pub fn cover_moving(&self) -> bool {
+    match &self.kind {
+      SlotKind::Cover { moving, .. } => moving.load(Ordering::SeqCst),
+      _ => false,
     }
   }
 
@@ -124,6 +194,127 @@ impl ExportSlot {
   fn store_on(&self, value: bool) -> bool {
     match &self.kind {
       SlotKind::OnOff { on } => on.swap(value, Ordering::SeqCst) != value,
+      _ => false,
+    }
+  }
+
+  /// Store contact closed flag; returns `true` when it changed.
+  fn store_closed(&self, value: bool) -> bool {
+    match &self.kind {
+      SlotKind::Contact { closed } => closed.swap(value, Ordering::SeqCst) != value,
+      _ => false,
+    }
+  }
+
+  /// Store motion occupied flag; returns `true` when it changed.
+  fn store_occupied(&self, value: bool) -> bool {
+    match &self.kind {
+      SlotKind::Motion { occupied } => occupied.swap(value, Ordering::SeqCst) != value,
+      _ => false,
+    }
+  }
+
+  /// Apply cover HA state; returns `true` when any field changed.
+  fn apply_cover_ha(&self, ha: window_covering_cluster::CoverHaState) -> bool {
+    let SlotKind::Cover {
+      position,
+      target,
+      moving,
+    } = &self.kind
+    else {
+      return false;
+    };
+
+    let mut changed = false;
+    let cur_pos = position.load(Ordering::SeqCst);
+    let cur_tgt = target.load(Ordering::SeqCst);
+    let cur_mov = moving.load(Ordering::SeqCst);
+
+    match ha.motion {
+      CoverMotion::Opening => {
+        if !cur_mov {
+          moving.store(true, Ordering::SeqCst);
+          changed = true;
+        }
+        // Keep commanded target; if HA started the motion, aim fully open.
+        if cur_tgt <= cur_pos && cur_tgt != 100 {
+          target.store(100, Ordering::SeqCst);
+          changed = true;
+        }
+        if let Some(p) = ha.position
+          && position.swap(p, Ordering::SeqCst) != p
+        {
+          changed = true;
+        }
+      }
+      CoverMotion::Closing => {
+        if !cur_mov {
+          moving.store(true, Ordering::SeqCst);
+          changed = true;
+        }
+        if cur_tgt >= cur_pos && cur_tgt != 0 {
+          target.store(0, Ordering::SeqCst);
+          changed = true;
+        }
+        if let Some(p) = ha.position
+          && position.swap(p, Ordering::SeqCst) != p
+        {
+          changed = true;
+        }
+      }
+      CoverMotion::Stopped => {
+        if cur_mov {
+          moving.store(false, Ordering::SeqCst);
+          changed = true;
+        }
+        if let Some(p) = ha.position {
+          if position.swap(p, Ordering::SeqCst) != p {
+            changed = true;
+          }
+          if target.swap(p, Ordering::SeqCst) != p {
+            changed = true;
+          }
+        }
+      }
+    }
+    changed
+  }
+
+  /// Controller open: target fully open, mark moving.
+  fn cover_command_open(&self) {
+    if let SlotKind::Cover { target, moving, .. } = &self.kind {
+      target.store(100, Ordering::SeqCst);
+      moving.store(true, Ordering::SeqCst);
+    }
+  }
+
+  /// Controller close: target fully closed, mark moving.
+  fn cover_command_close(&self) {
+    if let SlotKind::Cover { target, moving, .. } = &self.kind {
+      target.store(0, Ordering::SeqCst);
+      moving.store(true, Ordering::SeqCst);
+    }
+  }
+
+  /// Controller stop: freeze target at current position.
+  fn cover_command_stop(&self) {
+    if let SlotKind::Cover {
+      position,
+      target,
+      moving,
+    } = &self.kind
+    {
+      let p = position.load(Ordering::SeqCst);
+      target.store(p, Ordering::SeqCst);
+      moving.store(false, Ordering::SeqCst);
+    }
+  }
+
+  /// Controller go-to-position (HA scale 0–100).
+  fn cover_command_position(&self, ha_position: u8) {
+    if let SlotKind::Cover { target, moving, .. } = &self.kind {
+      target.store(ha_position.min(100), Ordering::SeqCst);
+      moving.store(true, Ordering::SeqCst);
     }
   }
 
@@ -134,12 +325,34 @@ impl ExportSlot {
   fn device_types(&self) -> &'static [MatterDeviceType] {
     match self.export.type_ {
       DeviceType::Light => &ON_OFF_LIGHT_DEVICE_TYPES,
-      _ => &ON_OFF_PLUG_DEVICE_TYPES,
+      DeviceType::OnOffSwitch | DeviceType::OnOffPlug | DeviceType::Outlet => &ON_OFF_PLUG_DEVICE_TYPES,
+      DeviceType::Contact => &CONTACT_DEVICE_TYPES,
+      DeviceType::Motion => &MOTION_DEVICE_TYPES,
+      DeviceType::Cover | DeviceType::Garage => &COVER_DEVICE_TYPES,
+    }
+  }
+
+  fn clusters(&self) -> &'static [Cluster<'static>] {
+    match &self.kind {
+      SlotKind::OnOff { .. } => &BRIDGED_ON_OFF_CLUSTERS,
+      SlotKind::Contact { .. } => &BRIDGED_CONTACT_CLUSTERS,
+      SlotKind::Motion { .. } => &BRIDGED_MOTION_CLUSTERS,
+      SlotKind::Cover { .. } => &BRIDGED_COVER_CLUSTERS,
+    }
+  }
+
+  /// Functional cluster id for this slot (for dataver / report routing).
+  fn functional_cluster_id(&self) -> ClusterId {
+    match &self.kind {
+      SlotKind::OnOff { .. } => ON_OFF_CLUSTER.id,
+      SlotKind::Contact { .. } => BOOLEAN_STATE_CLUSTER.id,
+      SlotKind::Motion { .. } => OCCUPANCY_CLUSTER.id,
+      SlotKind::Cover { .. } => WINDOW_COVERING_CLUSTER.id,
     }
   }
 
   fn endpoint(&self) -> Endpoint<'static> {
-    Endpoint::new(self.matter_endpoint, self.device_types(), &BRIDGED_ON_OFF_CLUSTERS)
+    Endpoint::new(self.matter_endpoint, self.device_types(), self.clusters())
   }
 
   /// Identity of the slot as controllers see it; a change means the exposed
@@ -151,6 +364,11 @@ impl ExportSlot {
 
   fn request_report(&self, bits: u32) {
     self.pending_reports.fetch_or(bits, Ordering::SeqCst);
+  }
+
+  fn mark_functional_changed(&self) {
+    self.functional_dataver.fetch_add(1, Ordering::SeqCst);
+    self.request_report(REPORT_FUNCTIONAL);
   }
 }
 
@@ -231,10 +449,10 @@ impl ExportPlane {
 
   /// Rebuild the slot table from the catalog, preserving per-export state.
   ///
-  /// Slot identity is the `export_id`: on/off value and data versions carry
+  /// Slot identity is the `export_id`: functional state and data versions carry
   /// over so controllers never see an endpoint go backwards.
   pub fn set_exports(&self, exports: &[Export]) {
-    let mut bridged: Vec<&Export> = exports.iter().filter(|e| is_matter_on_off_export(e)).collect();
+    let mut bridged: Vec<&Export> = exports.iter().filter(|e| is_matter_bridged_export(e)).collect();
     bridged.sort_by_key(|e| (e.endpoint_id.unwrap_or(EndptId::MAX), e.export_id));
     let known: BTreeSet<Uuid> = exports.iter().map(|e| e.export_id).collect();
 
@@ -295,21 +513,69 @@ impl ExportPlane {
           tracing::warn!(%export_id, "apply_state for unknown export");
           return (0, false);
         }
-        // Known but not bridged yet (sensor / cover types).
+        // Known but disabled / unassigned endpoint.
         return (states.len() as u32, false);
       };
 
-      if let Some(on) = on_off_from_states(&slot.export, states)
-        && slot.store_on(on)
-      {
-        // Value first, data version second: a read that races us returns the new
-        // value with the old version, never the reverse.
-        slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
-        slot.request_report(REPORT_ON_OFF);
-        tracing::debug!(%export_id, on, endpoint = slot.matter_endpoint, "HA state applied to Matter OnOff");
-        return (states.len() as u32, true);
-      }
-      (states.len() as u32, false)
+      let changed = match &slot.kind {
+        SlotKind::OnOff { .. } => {
+          if let Some(on) = on_off_from_states(&slot.export, states)
+            && slot.store_on(on)
+          {
+            slot.mark_functional_changed();
+            tracing::debug!(%export_id, on, endpoint = slot.matter_endpoint, "HA state applied to Matter OnOff");
+            true
+          } else {
+            false
+          }
+        }
+        SlotKind::Contact { .. } => {
+          if let Some(on) = primary_ha_on(&slot.export, states) {
+            let closed = bool_state_cluster::state_value_from_ha_on(on);
+            if slot.store_closed(closed) {
+              slot.mark_functional_changed();
+              tracing::debug!(%export_id, closed, endpoint = slot.matter_endpoint, "HA state applied to BooleanState");
+              true
+            } else {
+              false
+            }
+          } else {
+            false
+          }
+        }
+        SlotKind::Motion { .. } => {
+          if let Some(on) = primary_ha_on(&slot.export, states) {
+            if slot.store_occupied(on) {
+              slot.mark_functional_changed();
+              tracing::debug!(%export_id, occupied = on, endpoint = slot.matter_endpoint, "HA state applied to Occupancy");
+              true
+            } else {
+              false
+            }
+          } else {
+            false
+          }
+        }
+        SlotKind::Cover { .. } => {
+          if let Some(ha) = primary_cover_state(&slot.export, states)
+            && slot.apply_cover_ha(ha)
+          {
+            slot.mark_functional_changed();
+            tracing::debug!(
+              %export_id,
+              position = slot.cover_position(),
+              target = slot.cover_target(),
+              moving = slot.cover_moving(),
+              endpoint = slot.matter_endpoint,
+              "HA state applied to WindowCovering"
+            );
+            true
+          } else {
+            false
+          }
+        }
+      };
+      (states.len() as u32, changed)
     });
 
     if changed {
@@ -326,6 +592,9 @@ impl ExportPlane {
       let Some(slot) = state.slot_at(matter_endpoint) else {
         return false;
       };
+      if !matches!(slot.kind, SlotKind::OnOff { .. }) {
+        return false;
+      }
       if slot.store_on(on) {
         slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
       }
@@ -335,6 +604,49 @@ impl ExportPlane {
         on,
         endpoint = slot.matter_endpoint,
         "Matter controller OnOff → command queue"
+      );
+      true
+    })
+  }
+
+  /// Apply a controller Window Covering command and queue the matching HA command.
+  ///
+  /// Returns `false` when no cover slot serves `matter_endpoint`.
+  pub fn apply_controller_cover(&self, matter_endpoint: EndptId, kind: CommandKind, ha_position: Option<u8>) -> bool {
+    self.with_state(|state| {
+      let Some(slot) = state.slot_at(matter_endpoint) else {
+        return false;
+      };
+      if !matches!(slot.kind, SlotKind::Cover { .. }) {
+        return false;
+      }
+      match kind {
+        CommandKind::CoverOpen => slot.cover_command_open(),
+        CommandKind::CoverClose => slot.cover_command_close(),
+        CommandKind::CoverStop => slot.cover_command_stop(),
+        CommandKind::CoverPosition => {
+          let p = ha_position.unwrap_or(slot.cover_target());
+          slot.cover_command_position(p);
+        }
+        _ => return false,
+      }
+      slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
+      self.commands.lock().push_back(CommandRequest {
+        export_id: slot.export_id,
+        kind,
+        on: None,
+        level: None,
+        position: match kind {
+          CommandKind::CoverPosition => Some(ha_position.unwrap_or(slot.cover_target()).min(100)),
+          _ => None,
+        },
+      });
+      tracing::info!(
+        export_id = %slot.export_id,
+        ?kind,
+        position = ?ha_position,
+        endpoint = slot.matter_endpoint,
+        "Matter controller WindowCovering → command queue"
       );
       true
     })
@@ -351,12 +663,49 @@ impl ExportPlane {
       let mut out = Vec::new();
       for slot in &state.slots {
         let bits = slot.pending_reports.swap(0, Ordering::SeqCst);
-        if bits & REPORT_ON_OFF != 0 {
-          out.push((
-            slot.matter_endpoint,
-            ON_OFF_CLUSTER.id,
-            on_off_decl::AttributeId::OnOff as AttrId,
-          ));
+        if bits & REPORT_FUNCTIONAL != 0 {
+          match &slot.kind {
+            SlotKind::OnOff { .. } => {
+              out.push((
+                slot.matter_endpoint,
+                ON_OFF_CLUSTER.id,
+                on_off_decl::AttributeId::OnOff as AttrId,
+              ));
+            }
+            SlotKind::Contact { .. } => {
+              out.push((
+                slot.matter_endpoint,
+                BOOLEAN_STATE_CLUSTER.id,
+                bool_state_cluster::AttributeId::StateValue as AttrId,
+              ));
+            }
+            SlotKind::Motion { .. } => {
+              out.push((
+                slot.matter_endpoint,
+                OCCUPANCY_CLUSTER.id,
+                occupancy_cluster::AttributeId::Occupancy as AttrId,
+              ));
+            }
+            SlotKind::Cover { .. } => {
+              let ep = slot.matter_endpoint;
+              let cid = WINDOW_COVERING_CLUSTER.id;
+              out.push((
+                ep,
+                cid,
+                window_covering_cluster::AttributeId::CurrentPositionLiftPercent100ths as AttrId,
+              ));
+              out.push((
+                ep,
+                cid,
+                window_covering_cluster::AttributeId::TargetPositionLiftPercent100ths as AttrId,
+              ));
+              out.push((
+                ep,
+                cid,
+                window_covering_cluster::AttributeId::OperationalStatus as AttrId,
+              ));
+            }
+          }
         }
         if bits & REPORT_NODE_LABEL != 0 {
           out.push((
@@ -410,13 +759,12 @@ impl ExportPlane {
 
 impl ExportSlot {
   fn rebuild(export: &Export, matter_endpoint: EndptId, previous: Option<&ExportSlot>) -> Self {
+    let kind = Self::rebuild_kind(export, previous);
     let slot = Self {
       export_id: export.export_id,
       matter_endpoint,
       name: export.name.clone(),
-      kind: SlotKind::OnOff {
-        on: AtomicBool::new(previous.is_some_and(ExportSlot::on)),
-      },
+      kind,
       unique_id: export.export_id.simple().to_string(),
       export: export.clone(),
       desc_dataver: AtomicU32::new(previous.map_or_else(rand::random, |p| p.desc_dataver.load(Ordering::SeqCst))),
@@ -441,6 +789,65 @@ impl ExportSlot {
     }
     slot
   }
+
+  fn rebuild_kind(export: &Export, previous: Option<&ExportSlot>) -> SlotKind {
+    match export.type_ {
+      DeviceType::Light | DeviceType::OnOffSwitch | DeviceType::OnOffPlug | DeviceType::Outlet => {
+        let on = previous.map(ExportSlot::on).unwrap_or(false);
+        SlotKind::OnOff {
+          on: AtomicBool::new(on),
+        }
+      }
+      DeviceType::Contact => {
+        let closed = previous.map(ExportSlot::contact_closed).unwrap_or(true);
+        SlotKind::Contact {
+          closed: AtomicBool::new(closed),
+        }
+      }
+      DeviceType::Motion => {
+        let occupied = previous.map(ExportSlot::motion_occupied).unwrap_or(false);
+        SlotKind::Motion {
+          occupied: AtomicBool::new(occupied),
+        }
+      }
+      DeviceType::Cover | DeviceType::Garage => {
+        // Default fully open when no prior state (HA 100 = open).
+        let (position, target, moving) = match previous.map(|p| &p.kind) {
+          Some(SlotKind::Cover {
+            position,
+            target,
+            moving,
+          }) => (
+            position.load(Ordering::SeqCst),
+            target.load(Ordering::SeqCst),
+            moving.load(Ordering::SeqCst),
+          ),
+          _ => (100, 100, false),
+        };
+        SlotKind::Cover {
+          position: AtomicU8::new(position),
+          target: AtomicU8::new(target),
+          moving: AtomicBool::new(moving),
+        }
+      }
+    }
+  }
+}
+
+/// Primary-entity HA on/off (contact / motion). Linked entities never drive it.
+fn primary_ha_on(export: &Export, states: &[HaStateValue]) -> Option<bool> {
+  states
+    .iter()
+    .find(|st| st.entity_id == export.primary_entity_id)
+    .and_then(|st| ha_state_is_on(&st.state))
+}
+
+/// Primary-entity cover state.
+fn primary_cover_state(export: &Export, states: &[HaStateValue]) -> Option<window_covering_cluster::CoverHaState> {
+  states
+    .iter()
+    .find(|st| st.entity_id == export.primary_entity_id)
+    .map(ha_cover_from_state)
 }
 
 /// Clamp to at most `max_bytes`, never splitting a UTF-8 code point.
@@ -516,8 +923,23 @@ impl AsyncHandler for ExportPlane {
       id if id == BRIDGED_INFO_CLUSTER.id => {
         Handler::read(&bridged_info::HandlerAdaptor(BridgedInfoHandler { slot }), ctx, reply)
       }
-      id if id == ON_OFF_CLUSTER.id => Handler::read(
+      id if id == ON_OFF_CLUSTER.id && matches!(slot.kind, SlotKind::OnOff { .. }) => Handler::read(
         &on_off_decl::HandlerAdaptor(SlotOnOffHandler { plane: self, slot }),
+        ctx,
+        reply,
+      ),
+      id if id == BOOLEAN_STATE_CLUSTER.id && matches!(slot.kind, SlotKind::Contact { .. }) => Handler::read(
+        &bool_state_cluster::HandlerAdaptor(SlotBooleanStateHandler { slot }),
+        ctx,
+        reply,
+      ),
+      id if id == OCCUPANCY_CLUSTER.id && matches!(slot.kind, SlotKind::Motion { .. }) => Handler::read(
+        &occupancy_cluster::HandlerAdaptor(SlotOccupancyHandler { slot }),
+        ctx,
+        reply,
+      ),
+      id if id == WINDOW_COVERING_CLUSTER.id && matches!(slot.kind, SlotKind::Cover { .. }) => Handler::read(
+        &window_covering_cluster::HandlerAdaptor(SlotWindowCoveringHandler { plane: self, slot }),
         ctx,
         reply,
       ),
@@ -527,19 +949,27 @@ impl AsyncHandler for ExportPlane {
 
   async fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
     let (endpoint, cluster) = (ctx.cmd().endpoint_id, ctx.cmd().cluster_id);
-    if cluster != ON_OFF_CLUSTER.id {
-      return Err(ErrorCode::CommandNotFound.into());
-    }
 
     let state = self.snapshot();
     let Some(slot) = state.slot_at(endpoint) else {
       return Err(ErrorCode::EndpointNotFound.into());
     };
-    Handler::invoke(
-      &on_off_decl::HandlerAdaptor(SlotOnOffHandler { plane: self, slot }),
-      ctx,
-      reply,
-    )
+
+    if cluster == ON_OFF_CLUSTER.id && matches!(slot.kind, SlotKind::OnOff { .. }) {
+      return Handler::invoke(
+        &on_off_decl::HandlerAdaptor(SlotOnOffHandler { plane: self, slot }),
+        ctx,
+        reply,
+      );
+    }
+    if cluster == WINDOW_COVERING_CLUSTER.id && matches!(slot.kind, SlotKind::Cover { .. }) {
+      return Handler::invoke(
+        &window_covering_cluster::HandlerAdaptor(SlotWindowCoveringHandler { plane: self, slot }),
+        ctx,
+        reply,
+      );
+    }
+    Err(ErrorCode::CommandNotFound.into())
   }
 
   /// Every slot has to be visited: one notification can match several handlers,
@@ -565,7 +995,7 @@ impl AsyncHandler for ExportPlane {
         if hits_cluster(BRIDGED_INFO_CLUSTER.id) {
           slot.bridged_info_dataver.fetch_add(1, Ordering::SeqCst);
         }
-        if hits_cluster(ON_OFF_CLUSTER.id) {
+        if hits_cluster(slot.functional_cluster_id()) {
           slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
         }
       }
@@ -723,6 +1153,216 @@ impl on_off_decl::ClusterHandler for SlotOnOffHandler<'_> {
   }
 }
 
+/// Boolean State for a contact-sensor slot.
+struct SlotBooleanStateHandler<'a> {
+  slot: &'a ExportSlot,
+}
+
+impl bool_state_cluster::ClusterHandler for SlotBooleanStateHandler<'_> {
+  const CLUSTER: Cluster<'static> = BOOLEAN_STATE_CLUSTER;
+
+  fn dataver(&self) -> u32 {
+    self.slot.functional_dataver.load(Ordering::SeqCst)
+  }
+
+  fn dataver_changed(&self) {
+    self.slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
+  }
+
+  fn state_value(&self, _ctx: impl ReadContext) -> Result<bool, Error> {
+    Ok(self.slot.contact_closed())
+  }
+}
+
+/// Occupancy Sensing for a motion-sensor slot.
+struct SlotOccupancyHandler<'a> {
+  slot: &'a ExportSlot,
+}
+
+impl occupancy_cluster::ClusterHandler for SlotOccupancyHandler<'_> {
+  const CLUSTER: Cluster<'static> = OCCUPANCY_CLUSTER;
+
+  fn dataver(&self) -> u32 {
+    self.slot.functional_dataver.load(Ordering::SeqCst)
+  }
+
+  fn dataver_changed(&self) {
+    self.slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
+  }
+
+  fn occupancy(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::occupancy_sensing::OccupancyBitmap, Error> {
+    Ok(occupancy_cluster::occupancy_bitmap(self.slot.motion_occupied()))
+  }
+
+  fn occupancy_sensor_type(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::occupancy_sensing::OccupancySensorTypeEnum, Error> {
+    Ok(occupancy_cluster::sensor_type())
+  }
+
+  fn occupancy_sensor_type_bitmap(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::occupancy_sensing::OccupancySensorTypeBitmap, Error> {
+    Ok(occupancy_cluster::sensor_type_bitmap())
+  }
+}
+
+/// Window Covering for a cover/garage slot.
+struct SlotWindowCoveringHandler<'a> {
+  plane: &'a ExportPlane,
+  slot: &'a ExportSlot,
+}
+
+impl SlotWindowCoveringHandler<'_> {
+  fn is_garage(&self) -> bool {
+    matches!(self.slot.export.type_, DeviceType::Garage)
+  }
+
+  fn notify_position_attrs(&self, ctx: impl InvokeContext) -> Result<(), Error> {
+    ctx.notify_own_attr_changed(window_covering_cluster::AttributeId::CurrentPositionLiftPercent100ths as AttrId);
+    ctx.notify_own_attr_changed(window_covering_cluster::AttributeId::TargetPositionLiftPercent100ths as AttrId);
+    ctx.notify_own_attr_changed(window_covering_cluster::AttributeId::OperationalStatus as AttrId);
+    Ok(())
+  }
+}
+
+impl window_covering_cluster::ClusterHandler for SlotWindowCoveringHandler<'_> {
+  const CLUSTER: Cluster<'static> = WINDOW_COVERING_CLUSTER;
+
+  fn dataver(&self) -> u32 {
+    self.slot.functional_dataver.load(Ordering::SeqCst)
+  }
+
+  fn dataver_changed(&self) {
+    self.slot.functional_dataver.fetch_add(1, Ordering::SeqCst);
+  }
+
+  fn r#type(&self, _ctx: impl ReadContext) -> Result<rs_matter::dm::clusters::decl::window_covering::Type, Error> {
+    Ok(window_covering_cluster::cover_type(self.is_garage()))
+  }
+
+  fn config_status(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::window_covering::ConfigStatus, Error> {
+    Ok(window_covering_cluster::config_status())
+  }
+
+  fn operational_status(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::window_covering::OperationalStatus, Error> {
+    Ok(window_covering_cluster::operational_status(
+      self.slot.cover_position(),
+      self.slot.cover_target(),
+      self.slot.cover_moving(),
+    ))
+  }
+
+  fn end_product_type(
+    &self,
+    _ctx: impl ReadContext,
+  ) -> Result<rs_matter::dm::clusters::decl::window_covering::EndProductType, Error> {
+    Ok(window_covering_cluster::end_product_type(self.is_garage()))
+  }
+
+  fn current_position_lift_percent_100_ths(&self, _ctx: impl ReadContext) -> Result<Nullable<u16>, Error> {
+    Ok(Nullable::some(ha_position_to_percent100ths(self.slot.cover_position())))
+  }
+
+  fn target_position_lift_percent_100_ths(&self, _ctx: impl ReadContext) -> Result<Nullable<u16>, Error> {
+    Ok(Nullable::some(ha_position_to_percent100ths(self.slot.cover_target())))
+  }
+
+  fn mode(&self, _ctx: impl ReadContext) -> Result<rs_matter::dm::clusters::decl::window_covering::Mode, Error> {
+    Ok(window_covering_cluster::mode())
+  }
+
+  fn set_mode(
+    &self,
+    _ctx: impl WriteContext,
+    _value: rs_matter::dm::clusters::decl::window_covering::Mode,
+  ) -> Result<(), Error> {
+    // Advertised but not configurable from a bridge — ignore writes.
+    Ok(())
+  }
+
+  fn handle_up_or_open(&self, ctx: impl InvokeContext) -> Result<(), Error> {
+    if !self
+      .plane
+      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverOpen, None)
+    {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    self.notify_position_attrs(ctx)
+  }
+
+  fn handle_down_or_close(&self, ctx: impl InvokeContext) -> Result<(), Error> {
+    if !self
+      .plane
+      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverClose, None)
+    {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    self.notify_position_attrs(ctx)
+  }
+
+  fn handle_stop_motion(&self, ctx: impl InvokeContext) -> Result<(), Error> {
+    if !self
+      .plane
+      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverStop, None)
+    {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    self.notify_position_attrs(ctx)
+  }
+
+  fn handle_go_to_lift_percentage(
+    &self,
+    ctx: impl InvokeContext,
+    request: rs_matter::dm::clusters::decl::window_covering::GoToLiftPercentageRequest<'_>,
+  ) -> Result<(), Error> {
+    let percent = request.lift_percent_100_ths_value()?;
+    let ha_position = percent100ths_to_ha_position(percent);
+    if !self
+      .plane
+      .apply_controller_cover(self.slot.matter_endpoint, CommandKind::CoverPosition, Some(ha_position))
+    {
+      return Err(ErrorCode::EndpointNotFound.into());
+    }
+    self.notify_position_attrs(ctx)
+  }
+
+  fn handle_go_to_lift_value(
+    &self,
+    _ctx: impl InvokeContext,
+    _request: rs_matter::dm::clusters::decl::window_covering::GoToLiftValueRequest<'_>,
+  ) -> Result<(), Error> {
+    Err(ErrorCode::CommandNotFound.into())
+  }
+
+  fn handle_go_to_tilt_value(
+    &self,
+    _ctx: impl InvokeContext,
+    _request: rs_matter::dm::clusters::decl::window_covering::GoToTiltValueRequest<'_>,
+  ) -> Result<(), Error> {
+    Err(ErrorCode::CommandNotFound.into())
+  }
+
+  fn handle_go_to_tilt_percentage(
+    &self,
+    _ctx: impl InvokeContext,
+    _request: rs_matter::dm::clusters::decl::window_covering::GoToTiltPercentageRequest<'_>,
+  ) -> Result<(), Error> {
+    Err(ErrorCode::CommandNotFound.into())
+  }
+}
+
 impl ExportPlane {
   /// Mark config bumps through `generation` as applied. A concurrent `set_exports`
   /// that advanced past `generation` leaves the newer request pending.
@@ -768,6 +1408,29 @@ impl ExportPlane {
   fn on_for(&self, export_id: Uuid) -> Option<bool> {
     self.snapshot().slot_for(export_id).map(ExportSlot::on)
   }
+
+  fn contact_closed_for(&self, export_id: Uuid) -> Option<bool> {
+    self.snapshot().slot_for(export_id).map(ExportSlot::contact_closed)
+  }
+
+  fn motion_occupied_for(&self, export_id: Uuid) -> Option<bool> {
+    self.snapshot().slot_for(export_id).map(ExportSlot::motion_occupied)
+  }
+
+  fn cover_position_for(&self, export_id: Uuid) -> Option<u8> {
+    self.snapshot().slot_for(export_id).map(ExportSlot::cover_position)
+  }
+
+  fn cover_target_for(&self, export_id: Uuid) -> Option<u8> {
+    self.snapshot().slot_for(export_id).map(ExportSlot::cover_target)
+  }
+
+  fn cover_percent100ths_for(&self, export_id: Uuid) -> Option<u16> {
+    self
+      .snapshot()
+      .slot_for(export_id)
+      .map(|s| ha_position_to_percent100ths(s.cover_position()))
+  }
 }
 
 #[cfg(test)]
@@ -797,7 +1460,7 @@ mod tests {
   }
 
   #[test]
-  fn set_exports_maps_enabled_on_off_exports_to_catalog_endpoint_plus_one() {
+  fn set_exports_maps_enabled_exports_to_catalog_endpoint_plus_one() {
     let plane = ExportPlane::new();
     let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     plane.set_exports(&[
@@ -805,11 +1468,15 @@ mod tests {
       export(b, "Plug", "switch.b", DeviceType::OnOffPlug, true, Some(1)),
       // Disabled: not bridged.
       export(c, "Off", "light.c", DeviceType::Light, false, Some(7)),
-      // Not on/off capable: not bridged yet.
+      // Contact is bridged on its own BooleanState endpoint.
       export(d, "Door", "binary_sensor.d", DeviceType::Contact, true, Some(9)),
     ]);
 
-    assert_eq!(plane.endpoint_ids(), vec![2, 5], "catalog endpoint_id + 1, ascending");
+    assert_eq!(
+      plane.endpoint_ids(),
+      vec![2, 5, 10],
+      "catalog endpoint_id + 1, ascending"
+    );
   }
 
   #[test]
@@ -1104,6 +1771,204 @@ mod tests {
   /// The stack thread parks on `changed` inside `futures_lite::block_on`, with
   /// no tokio runtime in scope. This is the one cross-thread assumption the
   /// design rests on, so exercise it exactly the way the stack does.
+  #[test]
+  fn contact_ha_on_maps_to_state_value_false() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(
+      id,
+      "Door",
+      "binary_sensor.door",
+      DeviceType::Contact,
+      true,
+      Some(1),
+    )]);
+    // Default closed = true (Matter closed/normal).
+    assert!(plane.contact_closed_for(id).unwrap());
+
+    plane.apply_state(id, &[state("binary_sensor.door", "on")]);
+    assert!(
+      !plane.contact_closed_for(id).unwrap(),
+      "HA on (open) → Matter state_value false"
+    );
+
+    plane.apply_state(id, &[state("binary_sensor.door", "off")]);
+    assert!(plane.contact_closed_for(id).unwrap());
+  }
+
+  #[test]
+  fn motion_ha_on_sets_occupied() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(
+      id,
+      "PIR",
+      "binary_sensor.pir",
+      DeviceType::Motion,
+      true,
+      Some(1),
+    )]);
+    assert!(!plane.motion_occupied_for(id).unwrap());
+
+    plane.apply_state(id, &[state("binary_sensor.pir", "on")]);
+    assert!(plane.motion_occupied_for(id).unwrap());
+
+    plane.drain_reports();
+    plane.apply_state(id, &[state("binary_sensor.pir", "on")]);
+    assert!(plane.drain_reports().is_empty(), "unchanged motion reports nothing");
+  }
+
+  #[test]
+  fn cover_apply_state_current_position_37_is_percent100ths_6300() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("current_position".into(), serde_json::json!(37));
+    let applied = plane.apply_state(
+      id,
+      &[HaStateValue {
+        entity_id: "cover.shade".into(),
+        state: "open".into(),
+        attributes: attrs,
+      }],
+    );
+    assert_eq!(applied, 1);
+    assert_eq!(plane.cover_position_for(id), Some(37));
+    assert_eq!(plane.cover_percent100ths_for(id), Some(6300));
+    assert_eq!(plane.cover_target_for(id), Some(37), "stopped: current == target");
+  }
+
+  #[test]
+  fn cover_controller_commands_enqueue_correct_kinds() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+
+    assert!(plane.apply_controller_cover(2, CommandKind::CoverOpen, None));
+    assert!(plane.apply_controller_cover(2, CommandKind::CoverClose, None));
+    assert!(plane.apply_controller_cover(2, CommandKind::CoverStop, None));
+    assert!(plane.apply_controller_cover(2, CommandKind::CoverPosition, Some(42)));
+
+    let cmds = plane.take_commands();
+    assert_eq!(cmds.len(), 4);
+    assert_eq!(cmds[0].kind, CommandKind::CoverOpen);
+    assert_eq!(cmds[1].kind, CommandKind::CoverClose);
+    assert_eq!(cmds[2].kind, CommandKind::CoverStop);
+    assert_eq!(cmds[3].kind, CommandKind::CoverPosition);
+    assert_eq!(cmds[3].position, Some(42));
+    assert_eq!(plane.cover_target_for(id), Some(42));
+  }
+
+  #[test]
+  fn cover_go_to_lift_percentage_maps_matter_to_ha_scale() {
+    let plane = ExportPlane::new();
+    let id = Uuid::new_v4();
+    plane.set_exports(&[export(id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1))]);
+
+    // Matter 6300 (37% closed from open) → HA position 37.
+    let ha = percent100ths_to_ha_position(6300);
+    assert_eq!(ha, 37);
+    assert!(plane.apply_controller_cover(2, CommandKind::CoverPosition, Some(ha)));
+    let cmds = plane.take_commands();
+    assert_eq!(cmds[0].kind, CommandKind::CoverPosition);
+    assert_eq!(cmds[0].position, Some(37));
+  }
+
+  #[test]
+  fn cover_and_contact_state_survive_rebuild() {
+    let plane = ExportPlane::new();
+    let (cover_id, contact_id) = (Uuid::new_v4(), Uuid::new_v4());
+    plane.set_exports(&[
+      export(cover_id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1)),
+      export(
+        contact_id,
+        "Door",
+        "binary_sensor.door",
+        DeviceType::Contact,
+        true,
+        Some(2),
+      ),
+    ]);
+
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("current_position".into(), serde_json::json!(25));
+    plane.apply_state(
+      cover_id,
+      &[HaStateValue {
+        entity_id: "cover.shade".into(),
+        state: "open".into(),
+        attributes: attrs,
+      }],
+    );
+    plane.apply_state(contact_id, &[state("binary_sensor.door", "on")]);
+
+    plane.set_exports(&[
+      export(cover_id, "Shade", "cover.shade", DeviceType::Cover, true, Some(1)),
+      export(
+        contact_id,
+        "Door",
+        "binary_sensor.door",
+        DeviceType::Contact,
+        true,
+        Some(2),
+      ),
+    ]);
+    assert_eq!(plane.cover_position_for(cover_id), Some(25));
+    assert!(!plane.contact_closed_for(contact_id).unwrap());
+  }
+
+  #[test]
+  fn node_exposes_contact_motion_and_cover_device_types() {
+    let plane = ExportPlane::new();
+    plane.set_exports(&[
+      export(
+        Uuid::new_v4(),
+        "Door",
+        "binary_sensor.d",
+        DeviceType::Contact,
+        true,
+        Some(1),
+      ),
+      export(
+        Uuid::new_v4(),
+        "PIR",
+        "binary_sensor.m",
+        DeviceType::Motion,
+        true,
+        Some(2),
+      ),
+      export(Uuid::new_v4(), "Shade", "cover.s", DeviceType::Cover, true, Some(3)),
+    ]);
+
+    plane.access(|node| {
+      let dtypes = |ep: EndptId| -> Vec<u16> {
+        node
+          .endpoint(ep)
+          .unwrap()
+          .device_types
+          .iter()
+          .map(|d| d.dtype)
+          .collect()
+      };
+      assert_eq!(
+        dtypes(2),
+        vec![DEV_TYPE_CONTACT_SENSOR.dtype, DEV_TYPE_BRIDGED_NODE.dtype]
+      );
+      assert_eq!(
+        dtypes(3),
+        vec![DEV_TYPE_OCCUPANCY_SENSOR.dtype, DEV_TYPE_BRIDGED_NODE.dtype]
+      );
+      assert_eq!(
+        dtypes(4),
+        vec![DEV_TYPE_WINDOW_COVERING.dtype, DEV_TYPE_BRIDGED_NODE.dtype]
+      );
+      assert_eq!(node.endpoint(2).unwrap().clusters.len(), 3);
+      assert_eq!(node.endpoint(4).unwrap().clusters.len(), 3);
+    });
+  }
+
   #[test]
   fn a_thread_without_a_tokio_runtime_wakes_on_ha_state() {
     use std::sync::mpsc;

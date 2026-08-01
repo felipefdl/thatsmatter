@@ -43,6 +43,24 @@ pub fn is_matter_on_off_export(export: &Export) -> bool {
   export.enabled && export.type_.is_on_off_capable()
 }
 
+/// Whether this export should be published as any Matter bridged endpoint.
+///
+/// First-ship device types: on/off family, contact, motion, cover, garage.
+pub fn is_matter_bridged_export(export: &Export) -> bool {
+  export.enabled
+    && matches!(
+      export.type_,
+      DeviceType::Light
+        | DeviceType::OnOffSwitch
+        | DeviceType::OnOffPlug
+        | DeviceType::Outlet
+        | DeviceType::Contact
+        | DeviceType::Motion
+        | DeviceType::Cover
+        | DeviceType::Garage
+    )
+}
+
 /// HA domain service suggestion for an OnOff command (pure; no HA import).
 pub fn ha_service_for_on_off(entity_id: &str, on: bool) -> (&'static str, &'static str) {
   let domain = entity_id.split('.').next().unwrap_or("switch");
@@ -136,13 +154,25 @@ mod tests {
   }
 
   #[test]
-  fn only_enabled_on_off_capable_exports_are_bridged() {
+  fn only_enabled_on_off_capable_exports_are_on_off_bridged() {
     let enabled = exp(Uuid::new_v4(), "switch.b", DeviceType::OnOffSwitch, true, Some(1));
     let disabled = exp(Uuid::new_v4(), "light.a", DeviceType::Light, false, Some(2));
     let sensor = exp(Uuid::new_v4(), "binary_sensor.c", DeviceType::Contact, true, Some(3));
     assert!(is_matter_on_off_export(&enabled));
     assert!(!is_matter_on_off_export(&disabled));
     assert!(!is_matter_on_off_export(&sensor));
+  }
+
+  #[test]
+  fn all_enabled_first_ship_types_are_matter_bridged() {
+    let contact = exp(Uuid::new_v4(), "binary_sensor.c", DeviceType::Contact, true, Some(3));
+    let motion = exp(Uuid::new_v4(), "binary_sensor.m", DeviceType::Motion, true, Some(4));
+    let cover = exp(Uuid::new_v4(), "cover.shade", DeviceType::Cover, true, Some(5));
+    let disabled = exp(Uuid::new_v4(), "cover.x", DeviceType::Cover, false, Some(6));
+    assert!(is_matter_bridged_export(&contact));
+    assert!(is_matter_bridged_export(&motion));
+    assert!(is_matter_bridged_export(&cover));
+    assert!(!is_matter_bridged_export(&disabled));
   }
 
   #[test]
