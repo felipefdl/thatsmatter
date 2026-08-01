@@ -7,7 +7,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -33,7 +33,8 @@ class ThatsMatterConnectedSensor(BinarySensorEntity):
     _attr_translation_key = "bridge_connected"
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_should_poll = True
+    # Runtime pushes updates; polling only added latency to bridge transitions.
+    _attr_should_poll = False
 
     def __init__(self, runtime: ThatsMatterRuntime, entry: ConfigEntry) -> None:
         self._runtime = runtime
@@ -45,6 +46,18 @@ class ThatsMatterConnectedSensor(BinarySensorEntity):
             manufacturer="ThatsMatter",
             model="Matter bridge",
         )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._runtime.add_listener(self._handle_runtime_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._runtime.remove_listener(self._handle_runtime_update)
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_runtime_update(self) -> None:
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:

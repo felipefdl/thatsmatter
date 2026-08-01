@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -29,11 +29,12 @@ async def async_setup_entry(
 
 
 class ThatsMatterBaseSensor(SensorEntity):
-    """Shared device info for bridge diagnostics."""
+    """Shared device info and runtime push wiring for bridge diagnostics."""
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_should_poll = True
+    # Runtime pushes updates; polling only added latency to bridge transitions.
+    _attr_should_poll = False
 
     def __init__(self, runtime: ThatsMatterRuntime, entry: ConfigEntry) -> None:
         self._runtime = runtime
@@ -44,6 +45,18 @@ class ThatsMatterBaseSensor(SensorEntity):
             manufacturer="ThatsMatter",
             model="Matter bridge",
         )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._runtime.add_listener(self._handle_runtime_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._runtime.remove_listener(self._handle_runtime_update)
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_runtime_update(self) -> None:
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:

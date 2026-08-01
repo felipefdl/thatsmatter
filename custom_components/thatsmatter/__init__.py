@@ -79,10 +79,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a ThatsMatter config entry."""
+    from .services import async_unregister_services
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, _platforms())
-    runtime = hass.data[DOMAIN].pop(entry.entry_id, None)
+    domain_data = hass.data[DOMAIN]
+    runtime = domain_data.pop(entry.entry_id, None)
     if runtime is not None:
         await runtime.async_stop()
+    # Services are domain-wide: drop them only once the last runtime is gone,
+    # otherwise they linger in the UI and every call raises "not configured".
+    if not any(not key.startswith("_") for key in domain_data):
+        async_unregister_services(hass)
     return unload_ok
 
 

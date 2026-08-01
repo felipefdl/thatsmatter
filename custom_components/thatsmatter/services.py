@@ -166,3 +166,18 @@ def async_register_services(hass: HomeAssistant) -> None:
         _wrap(hass, async_reset_name_from_ha),
         schema=RESET_NAME_SCHEMA,
     )
+
+
+@callback
+def async_unregister_services(hass: HomeAssistant) -> None:
+    """Remove domain services (called when the last config entry unloads)."""
+    if not hass.data.pop(f"_{DOMAIN}_services", None):
+        return
+    for service in (
+        SERVICE_ADD_EXPORT,
+        SERVICE_UPDATE_EXPORT,
+        SERVICE_REMOVE_EXPORT,
+        SERVICE_SET_ENABLED,
+        SERVICE_RESET_NAME_FROM_HA,
+    ):
+        hass.services.async_remove(DOMAIN, service)

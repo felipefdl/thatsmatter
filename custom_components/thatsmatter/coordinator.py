@@ -194,8 +194,10 @@ class ThatsMatterRuntime:
             raise
 
     async def async_refresh_status(self) -> None:
-        """Refresh bridge status snapshot."""
+        """Refresh bridge status snapshot and notify listeners on any change."""
         client = self._require_client()
+        was_connected = self.bridge_connected
+        previous_status = self.bridge_status
         try:
             self.bridge_status = await client.status()
             self.bridge_connected = True
@@ -204,16 +206,23 @@ class ThatsMatterRuntime:
             self.bridge_connected = False
             self.last_error = str(err)
             self.bridge_status = {}
+        if (
+            self.bridge_connected != was_connected
+            or self.bridge_status != previous_status
+        ):
+            self.notify_listeners()
 
     async def async_refresh_pairing(self) -> None:
-        """Refresh pairing material for UI entities."""
+        """Refresh pairing material and notify listeners when it changes."""
         client = self._require_client()
+        previous_pairing = self.pairing
         try:
             self.pairing = await client.pairing()
-            self.notify_listeners()
         except BridgeClientError as err:
             _LOGGER.debug("Pairing refresh failed: %s", err)
             self.pairing = {}
+        if self.pairing != previous_pairing:
+            self.notify_listeners()
 
     async def async_push_all_states(self) -> None:
         """Push current HA state for every enabled export."""
@@ -282,9 +291,9 @@ class ThatsMatterRuntime:
     async def _command_loop(self) -> None:
         """Poll bridge commands and execute HA services."""
         while self._started:
+            was_connected = self.bridge_connected
             try:
                 if self.client is not None:
-                    was_connected = self.bridge_connected
                     commands = await self.client.take_commands()
                     self.bridge_connected = True
                     self.last_error = None
@@ -292,6 +301,7 @@ class ThatsMatterRuntime:
                         # This loop polls faster than the status loop, so it is
                         # usually the first to observe a reconnect.
                         await self._async_on_reconnected()
+                        self.notify_listeners()
                     for cmd in commands:
                         await self._async_execute_command(cmd)
             except asyncio.CancelledError:
@@ -299,6 +309,8 @@ class ThatsMatterRuntime:
             except BridgeClientError as err:
                 self.bridge_connected = False
                 self.last_error = str(err)
+                if was_connected:
+                    self.notify_listeners()
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Command loop error")
             await asyncio.sleep(COMMAND_POLL_INTERVAL)
