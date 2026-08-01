@@ -11,5 +11,13 @@ configuration:
   log_level:
     name: Log level
     description: Logging verbosity for the bridge process
+  mdns_interface:
+    name: LAN interface
+    description: >-
+      Interface the Matter stack reports/requires as operational (e.g. eth0,
+      enp1s0, wlan0). Needs IPv6 on that face (link-local is enough). Empty =
+      auto-select best non-virtual IPv6 LAN face (skips Docker/hassio). Does not
+      pin Avahi multi-homing — configure Avahi separately if needed. Wrong name
+      fails start.
 network:
   18465/TCP: ThatsMatter integration control plane (HTTP JSON)

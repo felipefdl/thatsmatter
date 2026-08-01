@@ -28,11 +28,13 @@ options:
   listen_port: 18465
   matter_backend: rs_matter
   log_level: info
+  mdns_interface: ""
 schema:
   bridge_name: str
   listen_port: port
   matter_backend: list(rs_matter|dev)
   log_level: list(trace|debug|info|warn|error)
+  mdns_interface: str?
 ports:
   18465/tcp: 18465
 ports_description:

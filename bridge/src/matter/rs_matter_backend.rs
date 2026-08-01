@@ -10,7 +10,23 @@
 //! window at startup only when no fabrics exist, and does not expose a
 //! read-only probe. Open/close from IPC is executed on the stack thread via a
 //! request mailbox in the plane `run()` loop.
+//!
+//! Networking: [`LanNetifs`] exposes a single Matterbridge-style LAN face so
+//! multi-NIC HAOS hosts do not bind Docker/hassio virtual interfaces. mDNS
+//! prefers system Avahi after a live D-Bus probe and falls back to Zeroconf
+//! (both need the Avahi daemon on typical Linux/HAOS).
+//!
+//! # Readiness honesty
+//!
+//! `ready_tx` is signaled only after UDP 5540 preflight, `stack.startup`, LAN
+//! validation, and mDNS backend selection — **immediately before**
+//! `block_on(run_preex)`. Residual race: ready means "about to enter run", not
+//! that Matter UDP/mDNS sockets are already bound. If `run_preex` later exits
+//! (error or unexpected return), shared `running`/`error` are updated so
+//! `/status` stops claiming a healthy stack.
 
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,17 +39,25 @@ use uuid::Uuid;
 use super::backend::{MatterBackend, clamp_pairing_timeout};
 use super::commissioning::CommissioningMaterial;
 use super::export_plane::{BridgedEndpointMatcher, ExportPlane};
+use super::lan_netif::LanNetifs;
 use super::pairing::{basic_comm_data, pairing_material_for};
 use crate::catalog::{CommandRequest, Export, HaStateValue, PairingMaterial};
 use crate::config::BackendKind;
 
+/// Matter accessory UDP port (CSA).
+const MATTER_UDP_PORT: u16 = 5540;
+
 /// Production Matter backend: commissionable IP bridge.
 pub struct RsMatterBackend {
   data_dir: PathBuf,
+  /// Optional LAN interface pin (`eth0`, `enp1s0`, …); `None` = auto-select.
+  mdns_interface: Option<String>,
   /// Bridged endpoint table, shared with the Matter stack thread.
   plane: Arc<ExportPlane>,
-  running: AtomicBool,
-  error: Mutex<Option<String>>,
+  /// Shared with the stack thread so death after ready clears `/status.running`.
+  running: Arc<AtomicBool>,
+  /// Shared with the stack thread so unexpected exit surfaces on `/status.error`.
+  error: Arc<Mutex<Option<String>>>,
   /// Matter stack thread (keeps process advertising while join handle is alive).
   _stack_thread: Mutex<Option<JoinHandle<()>>>,
   commissioning: CommissioningMaterial,
@@ -41,14 +65,16 @@ pub struct RsMatterBackend {
 }
 
 impl RsMatterBackend {
-  pub fn new(data_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+  pub fn new(data_dir: impl Into<PathBuf>, mdns_interface: Option<String>) -> anyhow::Result<Self> {
     let data_dir = data_dir.into();
     let commissioning = CommissioningMaterial::load_or_generate(&data_dir)?;
+    let mdns_interface = mdns_interface.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Ok(Self {
       data_dir,
+      mdns_interface,
       plane: Arc::new(ExportPlane::new()),
-      running: AtomicBool::new(false),
-      error: Mutex::new(None),
+      running: Arc::new(AtomicBool::new(false)),
+      error: Arc::new(Mutex::new(None)),
       _stack_thread: Mutex::new(None),
       pairing: pairing_material_for(&commissioning),
       commissioning,
@@ -59,12 +85,15 @@ impl RsMatterBackend {
     let data_dir = self.data_dir.clone();
     let commissioning = self.commissioning;
     let plane = Arc::clone(&self.plane);
+    let mdns_interface = self.mdns_interface.clone();
+    let running = Arc::clone(&self.running);
+    let error = Arc::clone(&self.error);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handle = thread::Builder::new()
       .name("thatsmatter-matter".into())
       .spawn(move || {
-        if let Err(err) = run_matter_stack(data_dir, commissioning, plane, ready_tx) {
+        if let Err(err) = run_matter_stack(data_dir, commissioning, plane, mdns_interface, running, error, ready_tx) {
           tracing::error!(error = %err, "Matter stack thread exited with error");
         }
       })?;
@@ -76,21 +105,104 @@ impl RsMatterBackend {
       }
       Ok(Err(msg)) => {
         *self.error.lock() = Some(msg.clone());
+        self.running.store(false, Ordering::SeqCst);
         anyhow::bail!("Matter stack failed to start: {msg}");
       }
       Err(_) => {
         let msg = "Matter stack start timed out".to_string();
         *self.error.lock() = Some(msg.clone());
+        self.running.store(false, Ordering::SeqCst);
         anyhow::bail!(msg);
       }
     }
   }
 }
 
+/// Thin stack `Mdns` adapter around `rs-matter`'s Avahi backend.
+///
+/// Implemented here so we can enable `zbus` on `rs-matter` without also enabling
+/// `rs-matter-stack`'s `zbus` feature (which pulls a Linux-only bluez path).
+struct AvahiMdnsService {
+  inner: rs_matter_stack::matter::transport::network::mdns::avahi::AvahiMdns,
+}
+
+impl rs_matter_stack::mdns::Mdns for AvahiMdnsService {
+  async fn run<C, U>(
+    &mut self,
+    matter: &rs_matter_stack::matter::Matter<'_>,
+    _crypto: C,
+    _udp: U,
+    _mac: &[u8],
+    _ipv4: core::net::Ipv4Addr,
+    _ipv6: core::net::Ipv6Addr,
+    _interface: u32,
+  ) -> Result<(), rs_matter_stack::matter::error::Error>
+  where
+    C: rs_matter_stack::matter::crypto::Crypto,
+    U: edge_nal::UdpBind,
+  {
+    self.inner.run(matter).await
+  }
+}
+
+/// Briefly probe UDP 5540 on IPv6 and IPv4 so we fail fast if Matterbridge (or
+/// another Matter accessory) already owns the port.
+///
+/// Sockets are dropped before the stack binds. Residual race: another process
+/// can grab 5540 between this probe and `run_preex` bind.
+fn preflight_matter_udp_port() -> Result<(), String> {
+  // Probe IPv6 first (Matter prefers dual-stack / IPv6 bind).
+  match UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, MATTER_UDP_PORT))) {
+    Ok(sock) => drop(sock),
+    Err(err) if err.kind() == ErrorKind::AddrInUse => {
+      return Err(format!(
+        "UDP port {MATTER_UDP_PORT} already in use (IPv6). Stop Matterbridge or any other Matter \
+         process that binds 5540, then restart ThatsMatter."
+      ));
+    }
+    Err(err) => {
+      // e.g. IPv6 disabled on the host — still try IPv4.
+      tracing::debug!(error = %err, "UDP {MATTER_UDP_PORT} IPv6 preflight skipped");
+    }
+  }
+
+  match UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, MATTER_UDP_PORT))) {
+    Ok(sock) => drop(sock),
+    Err(err) if err.kind() == ErrorKind::AddrInUse => {
+      return Err(format!(
+        "UDP port {MATTER_UDP_PORT} already in use (IPv4). Stop Matterbridge or any other Matter \
+         process that binds 5540, then restart ThatsMatter."
+      ));
+    }
+    Err(err) => {
+      tracing::debug!(error = %err, "UDP {MATTER_UDP_PORT} IPv4 preflight skipped");
+    }
+  }
+
+  Ok(())
+}
+
+/// Confirm Avahi is actually answering on the system bus (not just that the bus exists).
+async fn probe_avahi(conn: &rs_matter_stack::matter::utils::zbus::Connection) -> Result<String, String> {
+  use rs_matter_stack::matter::utils::zbus_proxies::avahi::server2::Server2Proxy;
+
+  let proxy = Server2Proxy::new(conn)
+    .await
+    .map_err(|err| format!("Avahi Server2 proxy: {err}"))?;
+  let version = proxy
+    .get_version_string()
+    .await
+    .map_err(|err| format!("Avahi GetVersionString: {err}"))?;
+  Ok(version)
+}
+
 fn run_matter_stack(
   data_dir: PathBuf,
   commissioning: CommissioningMaterial,
   plane: Arc<ExportPlane>,
+  mdns_interface: Option<String>,
+  running: Arc<AtomicBool>,
+  error: Arc<Mutex<Option<String>>>,
   ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
   use core::mem::MaybeUninit;
@@ -99,14 +211,21 @@ fn run_matter_stack(
   use rs_matter_stack::matter::crypto::default_crypto;
   use rs_matter_stack::matter::dm::EmptyHandler;
   use rs_matter_stack::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
-  use rs_matter_stack::matter::dm::networks::unix::UnixNetifs;
   use rs_matter_stack::matter::persist::DirKvBlobStore;
+  use rs_matter_stack::matter::transport::network::mdns::avahi::AvahiMdns;
   use rs_matter_stack::matter::transport::network::mdns::zeroconf::ZeroconfMdns;
   use rs_matter_stack::matter::utils::init::InitMaybeUninit;
+  use rs_matter_stack::matter::utils::zbus::Connection;
 
   const BUMP_SIZE: usize = 23500;
 
+  // Set true only after ready_tx Ok is sent (visible after the closure returns).
+  let ready_sent = AtomicBool::new(false);
+
   let result = (|| -> Result<(), String> {
+    // Fail fast if another Matter accessory owns the transport port.
+    preflight_matter_udp_port()?;
+
     // Heap-allocated and initialized in place: the stack is tens of KB, and
     // leaking it is what gives the `&'static` borrow `run_preex` needs.
     let uninit: &'static mut MaybeUninit<EthMatterStack<BUMP_SIZE, ()>> = Box::leak(Box::new_uninit());
@@ -143,24 +262,102 @@ fn run_matter_stack(
       .matter()
       .print_standard_qr_text(rs_matter_stack::matter::pairing::DiscoveryCapabilities::IP);
 
+    // Matterbridge-style LAN filter: single best real face (or pin).
+    let lan = LanNetifs::new(mdns_interface.clone());
+    lan.log_inventory();
+    lan.validate_for_start()?;
+
+    // Choose mDNS backend before ready: system bus alone is not enough — probe Avahi.
+    // On Linux/HAOS both Avahi and Zeroconf typically need the Avahi daemon; if the
+    // probe fails we still fall back but log that honestly.
+    enum MdnsChoice {
+      Avahi(rs_matter_stack::matter::utils::zbus::Connection),
+      Zeroconf,
+    }
+
+    let mdns_choice = match futures_lite::future::block_on(Connection::system()) {
+      Ok(conn) => match futures_lite::future::block_on(probe_avahi(&conn)) {
+        Ok(version) => {
+          tracing::info!(%version, "mDNS backend: Avahi (GetVersionString probe ok)");
+          MdnsChoice::Avahi(conn)
+        }
+        Err(probe_err) => {
+          tracing::warn!(
+            error = %probe_err,
+            "mDNS: Avahi D-Bus reachable but daemon probe failed; falling back to Zeroconf \
+             (on Linux/HAOS Zeroconf also typically needs the Avahi daemon — fix Avahi if discovery fails)"
+          );
+          MdnsChoice::Zeroconf
+        }
+      },
+      Err(err) => {
+        tracing::warn!(
+          error = %err,
+          "mDNS: system D-Bus unavailable; using Zeroconf \
+           (on Linux/HAOS both Avahi and Zeroconf need the Avahi daemon)"
+        );
+        MdnsChoice::Zeroconf
+      }
+    };
+
+    // Ready: preflight + startup + LAN validate + mDNS selection done.
+    // Residual race: run_preex has not bound sockets yet.
+    running.store(true, Ordering::SeqCst);
     let _ = ready_tx.send(Ok(()));
+    ready_sent.store(true, Ordering::SeqCst);
 
-    let matter = core::pin::pin!(stack.run_preex(
-      edge_nal_std::Stack::new(),
-      UnixNetifs,
-      ZeroconfMdns::new(),
-      &crypto,
-      (plane.as_ref(), handler),
-      kv,
-      (),
-    ));
-
-    futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+    match mdns_choice {
+      MdnsChoice::Avahi(conn) => {
+        tracing::info!("mDNS: active backend = Avahi (system D-Bus)");
+        let matter = core::pin::pin!(stack.run_preex(
+          edge_nal_std::Stack::new(),
+          LanNetifs::new(mdns_interface),
+          AvahiMdnsService {
+            inner: AvahiMdns::new(conn),
+          },
+          &crypto,
+          (plane.as_ref(), handler),
+          kv,
+          (),
+        ));
+        futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+      }
+      MdnsChoice::Zeroconf => {
+        tracing::info!("mDNS: active backend = Zeroconf");
+        let matter = core::pin::pin!(stack.run_preex(
+          edge_nal_std::Stack::new(),
+          LanNetifs::new(mdns_interface),
+          ZeroconfMdns::new(),
+          &crypto,
+          (plane.as_ref(), handler),
+          kv,
+          (),
+        ));
+        futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
+      }
+    }
   })();
 
-  if let Err(ref err) = result {
-    let _ = ready_tx.send(Err(err.clone()));
+  // Stack left run (or failed before ready): never leave /status claiming healthy.
+  running.store(false, Ordering::SeqCst);
+  let was_ready = ready_sent.load(Ordering::SeqCst);
+  match &result {
+    Err(err) => {
+      *error.lock() = Some(err.clone());
+      if !was_ready {
+        let _ = ready_tx.send(Err(err.clone()));
+      } else {
+        tracing::error!(error = %err, "Matter stack run exited after ready; status will show not running");
+      }
+    }
+    Ok(()) if was_ready => {
+      let msg = "Matter stack exited unexpectedly".to_string();
+      *error.lock() = Some(msg.clone());
+      tracing::error!("{msg}");
+    }
+    Ok(()) => {}
   }
+
   result
 }
 
@@ -175,13 +372,17 @@ impl MatterBackend for RsMatterBackend {
       return Ok(());
     }
     std::fs::create_dir_all(&self.data_dir)?;
+    // Clear a stale error from a previous failed start attempt.
+    *self.error.lock() = None;
     self.spawn_stack()?;
-    self.running.store(true, Ordering::SeqCst);
+    // `running` is set true by the stack thread when it signals ready.
     tracing::info!(
       data_dir = %self.data_dir.display(),
       setup_code = %self.pairing.setup_code,
       pairing_open = self.plane.pairing_open(),
       fabrics = self.plane.commissioned_fabrics(),
+      mdns_interface = ?self.mdns_interface,
+      running = self.running.load(Ordering::SeqCst),
       "RsMatterBackend started (commissionable IP bridge)"
     );
     Ok(())

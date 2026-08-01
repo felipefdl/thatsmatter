@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
       b
     }
     BackendKind::RsMatter => {
-      let b = Arc::new(RsMatterBackend::new(&cfg.data_dir)?);
+      let b = Arc::new(RsMatterBackend::new(&cfg.data_dir, cfg.mdns_interface.clone())?);
       b.start().await?;
       let exports = catalog.list();
       b.set_exports(&exports).await?;

@@ -75,5 +75,7 @@ HA_SSH=root@homeassistant.local ./scripts/install-haos.sh
 ## Notes
 
 - Pairing uses CSA **test** credentials (uncertified prompts are normal)
-- One Matter OnOff endpoint is bound to the primary enabled OnOff export
-- Controllers must share the LAN with HA (mDNS / IPv6)
+- Each enabled export gets a Matter bridged endpoint (OnOff, cover/garage, contact, motion) under an aggregator
+- Controllers must share the **same L2 LAN** with HA (mDNS / IPv6). Matter needs **IPv6 on the LAN face** (link-local `fe80::` is enough).
+- On multi-NIC hosts, set App option **LAN interface** (e.g. `eth0`) if HomeKit or other controllers cannot find the bridge. That option selects which interface the Matter stack **reports/requires as operational**; empty auto-selects the best non-virtual face with IPv6 (skips Docker/hassio). Avahi still multi-homes per host Avahi policy unless you configure Avahi separately.
+- Stop Matterbridge (or any other Matter process) before testing — UDP **5540** must be free; the bridge fails start if the port is in use.

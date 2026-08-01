@@ -62,9 +62,14 @@ fn internal(msg: impl Into<String>) -> Response {
 }
 
 /// `GET /health`
-pub async fn health() -> Json<HealthResponse> {
+///
+/// `ok` is true only while the Matter backend reports running. After a stack-thread
+/// death, this goes false so supervisors and operators see the failure (IPC can still
+/// answer; the Matter plane is not usable).
+pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
+  let ok = state.backend.is_running().await;
   Json(HealthResponse {
-    ok: true,
+    ok,
     version: VERSION.to_string(),
   })
 }

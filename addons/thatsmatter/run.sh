@@ -6,6 +6,7 @@ BRIDGE_NAME="$(bashio::config 'bridge_name')"
 LISTEN_PORT="$(bashio::config 'listen_port')"
 MATTER_BACKEND="$(bashio::config 'matter_backend')"
 LOG_LEVEL="$(bashio::config 'log_level')"
+MDNS_INTERFACE="$(bashio::config 'mdns_interface')"
 
 # Host network: bind all interfaces so Supervisor/Core can reach IPC.
 LISTEN_ADDR="0.0.0.0:${LISTEN_PORT}"
@@ -16,6 +17,9 @@ bashio::log.info "  listen=${LISTEN_ADDR}"
 bashio::log.info "  data_dir=${DATA_DIR}"
 bashio::log.info "  backend=${MATTER_BACKEND}"
 bashio::log.info "  name=${BRIDGE_NAME}"
+if [ -n "${MDNS_INTERFACE}" ]; then
+  bashio::log.info "  mdns_interface=${MDNS_INTERFACE}"
+fi
 
 # Advertise to Home Assistant for config flow discovery.
 # On host_network, Core reaches the bridge via 127.0.0.1.
@@ -36,6 +40,10 @@ export THATSMATTER_DATA_DIR="${DATA_DIR}"
 export THATSMATTER_BRIDGE_NAME="${BRIDGE_NAME}"
 export THATSMATTER_MATTER_BACKEND="${MATTER_BACKEND}"
 export THATSMATTER_ALLOW_NON_LOOPBACK="true"
+
+if [ -n "${MDNS_INTERFACE}" ]; then
+  export THATSMATTER_MDNS_INTERFACE="${MDNS_INTERFACE}"
+fi
 
 exec /usr/bin/thatsmatter-bridge \
   --listen "${LISTEN_ADDR}" \
