@@ -61,10 +61,19 @@ pub struct PatchExport {
   pub primary_entity_id: Option<String>,
   #[serde(default)]
   pub linked: Option<BTreeMap<String, String>>,
-  #[serde(default)]
+  /// `Some(None)` (explicit JSON `null`) clears the area; `None` (absent) leaves it unchanged.
+  #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
   pub area_id: Option<Option<String>>,
   #[serde(default)]
   pub enabled: Option<bool>,
+}
+
+/// Keep an explicit JSON `null` distinguishable from an absent field.
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

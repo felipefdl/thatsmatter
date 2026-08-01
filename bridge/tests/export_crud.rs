@@ -127,6 +127,26 @@ async fn export_crud_and_endpoint_stable() {
   assert_eq!(patched.name, "Lamp");
   assert!(!patched.enabled);
   assert_eq!(patched.endpoint_id, endpoint_id);
+  // Patch without area_id leaves the area untouched.
+  assert_eq!(patched.area_id.as_deref(), Some("kitchen"));
+
+  // Explicit null clears area_id (protocol contract).
+  let clear = serde_json::json!({ "area_id": null });
+  let res = app
+    .clone()
+    .oneshot(
+      axum::http::Request::builder()
+        .method("PATCH")
+        .uri(format!("/exports/{export_id}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(clear.to_string()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), 200);
+  let cleared: Export = serde_json::from_value(body_json(res).await).unwrap();
+  assert_eq!(cleared.area_id, None);
 
   let res = app
     .clone()
