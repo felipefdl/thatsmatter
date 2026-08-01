@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -205,10 +206,8 @@ class ThatsMatterRuntime:
         for task in (self._command_task, self._status_task):
             if task is not None and not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
         self._command_task = None
         self._status_task = None
         await self.async_dismiss_pairing_notification()

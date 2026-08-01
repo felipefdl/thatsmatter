@@ -1,0 +1,7 @@
+target-version = "py312"
+line-length = 100
+include = ["custom_components/thatsmatter/**/*.py", "scripts/*.py"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # long strings in service/UI text; line-length still guides new code

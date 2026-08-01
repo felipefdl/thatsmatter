@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
@@ -14,9 +14,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
-    SelectOptionDict,
     TextSelector,
     TextSelectorConfig,
 )
@@ -43,6 +43,7 @@ from .export_manager import (
 )
 from .helpers import SUPPORTED_DOMAINS, pairing_credentials_for_display
 
+
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate bridge host/port/name and return entry fields."""
     host = data[CONF_BRIDGE_HOST].strip()
@@ -58,10 +59,8 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     session = async_get_clientsession(hass)
     client = BridgeClient(host, port, session, timeout=3.0)
-    try:
+    with contextlib.suppress(BridgeClientError):
         await client.health()
-    except BridgeClientError:
-        pass
 
     return {
         "title": name,

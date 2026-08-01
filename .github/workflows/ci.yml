@@ -28,5 +28,6 @@ jobs:
           python-version: "3.12"
       - name: Test custom component helpers
         run: |
-          pip install pytest
+          pip install pytest ruff
+          ruff check .
           pytest custom_components/thatsmatter/tests -q

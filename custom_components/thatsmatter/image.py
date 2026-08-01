@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import datetime
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.config_entries import ConfigEntry
