@@ -1246,21 +1246,13 @@ impl ExportPlane {
   ) -> Result<(), String> {
     match op {
       WindowOp::Open(timeout_secs) => {
-        // Already open: do not close/reopen (avoids thrashing the stack window
-        // and mDNS). Optionally extend the tracked deadline without touching
-        // the stack — rs-matter rejects open while a window is already open.
+        // Already open (bridge-tracked): true no-op — do not extend deadline,
+        // close, or reopen (avoids thrashing the stack window and mDNS).
         if self.pairing_open() {
-          let count = fabric_count();
-          self.establish_fabric_baseline(count);
-          let now = epoch_secs();
-          let proposed = now.saturating_add(u64::from(timeout_secs));
-          let current = self.window_deadline.load(Ordering::SeqCst);
-          if proposed > current {
-            self.window_deadline.store(proposed, Ordering::SeqCst);
-            tracing::info!(timeout_secs, "pairing window already open; extended tracked deadline");
-          } else {
-            tracing::info!(timeout_secs, "pairing window already open; skipping close/reopen");
-          }
+          tracing::info!(
+            timeout_secs,
+            "pairing window already open; open is a no-op (deadline unchanged)"
+          );
           return Ok(());
         }
 
@@ -1270,17 +1262,9 @@ impl ExportPlane {
         let count = fabric_count();
         self.establish_fabric_baseline(count);
 
-        // Window is closed in our tracking, but the stack may still hold one
-        // (e.g. startup window we already expired). Close first so open succeeds.
-        // On successful close, clear our deadline immediately: if the subsequent
-        // open fails we must stay closed (no stale pairing_open).
-        match close_comm_window() {
-          Ok(_) => self.mark_window_closed(),
-          Err(err) => {
-            tracing::warn!(error = %err, "pre-open close_comm_window failed; still attempting open");
-          }
-        }
-
+        // Our tracked window is closed. Try open first without preemptive close
+        // so we never blind-close an untracked ECM / controller window.
+        // rs-matter returns Busy (Error::Busy) when any window is already open.
         match open_basic_comm_window(timeout_secs) {
           Ok(()) => {
             let count = fabric_count();
@@ -1288,8 +1272,20 @@ impl ExportPlane {
             tracing::info!(timeout_secs, "basic commissioning window opened");
             Ok(())
           }
+          Err(err) if is_comm_window_busy(&err) => {
+            // Multi-admin safety: do not close+replace a foreign window.
+            tracing::warn!(
+              error = %err,
+              "open pairing window refused: another commissioning window is active \
+               (not opened by this bridge); not closing it"
+            );
+            Err(
+              "another commissioning window is active (not opened by this bridge); \
+               refuse to close it for multi-admin safety"
+                .to_string(),
+            )
+          }
           Err(err) => {
-            // Pre-open close already cleared the deadline on success; keep closed.
             tracing::warn!(error = %err, "open_basic_comm_window failed");
             Err(format!("open pairing window failed: {err}"))
           }
@@ -1330,6 +1326,12 @@ impl ExportPlane {
     let count = ctx.matter().with_state(|state| state.fabrics.iter().count());
     u8::try_from(count).unwrap_or(u8::MAX)
   }
+}
+
+/// rs-matter rejects a second open with `ErrorCode::Busy` (Debug: `Error::Busy`).
+fn is_comm_window_busy(err: &str) -> bool {
+  let lower = err.to_ascii_lowercase();
+  lower.contains("busy") || (lower.contains("already") && lower.contains("open"))
 }
 
 /// Bridged Device Basic Information for one slot.
@@ -2600,7 +2602,7 @@ mod tests {
       },
     );
     assert!(result.is_ok());
-    assert_eq!(close_calls, 1);
+    assert_eq!(close_calls, 0, "open tries first without preemptive close");
     assert_eq!(open_calls, 1);
     assert!(plane.pairing_open());
     // Same fabric count after open must not clear the new deadline.
@@ -2640,12 +2642,12 @@ mod tests {
     assert!(plane.pairing_open());
   }
 
-  /// Close-then-open failure when currently closed: close first (clears deadline),
-  /// then open fails → final deadline stays zero (no stale pairing_open).
+  /// Open failure when currently closed: try open only (no preemptive close);
+  /// deadline stays zero (no stale pairing_open).
   #[test]
-  fn close_success_open_failure_leaves_window_closed() {
+  fn open_failure_leaves_window_closed_without_preemptive_close() {
     let plane = ExportPlane::new();
-    // Fabrics present at startup → no bridge-tracked window (must take close/open path).
+    // Fabrics present at startup → no bridge-tracked window.
     plane.note_startup_commissioning_state(1);
     assert!(!plane.pairing_open());
 
@@ -2664,17 +2666,49 @@ mod tests {
       },
     );
     assert!(result.is_err(), "open failure must surface as Err");
-    assert_eq!(close_calls, 1, "open path must call stack close first");
-    assert_eq!(open_calls, 1, "open path must attempt stack open after close");
+    assert_eq!(close_calls, 0, "must not preemptive-close untracked windows");
+    assert_eq!(open_calls, 1, "open path must attempt stack open");
     assert!(!plane.pairing_open());
     assert_eq!(
       plane.window_deadline.load(Ordering::SeqCst),
       0,
-      "failed open after successful pre-open close must leave deadline zero"
+      "failed open must leave deadline zero"
     );
   }
 
-  /// Open while already open: no stack close/reopen thrash; stays open.
+  /// Busy (foreign window open): clear error, no close.
+  #[test]
+  fn open_when_foreign_window_busy_returns_error_without_close() {
+    let plane = ExportPlane::new();
+    plane.note_startup_commissioning_state(1);
+    assert!(!plane.pairing_open());
+
+    let mut close_calls = 0u32;
+    let mut open_calls = 0u32;
+    let result = plane.execute_window_op(
+      WindowOp::Open(300),
+      || 1u8,
+      || {
+        close_calls += 1;
+        Ok(true)
+      },
+      |_timeout| {
+        open_calls += 1;
+        Err("Error::Busy".into())
+      },
+    );
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(
+      msg.contains("another commissioning window is active"),
+      "expected multi-admin safety message, got: {msg}"
+    );
+    assert_eq!(close_calls, 0, "must not close foreign window");
+    assert_eq!(open_calls, 1);
+    assert!(!plane.pairing_open());
+  }
+
+  /// Open while already open: true no-op — no stack ops, deadline unchanged.
   #[test]
   fn open_when_already_open_is_noop() {
     let plane = ExportPlane::new();
@@ -2700,10 +2734,10 @@ mod tests {
     assert_eq!(close_calls, 0, "must not close when window already open");
     assert_eq!(open_calls, 0, "must not reopen when window already open");
     assert!(plane.pairing_open());
-    // Deadline is only extended when proposed > current; startup 900s usually wins.
-    assert!(
-      plane.window_deadline.load(Ordering::SeqCst) >= deadline_before,
-      "deadline must not shrink on already-open open"
+    assert_eq!(
+      plane.window_deadline.load(Ordering::SeqCst),
+      deadline_before,
+      "already-open open must not change deadline"
     );
   }
 

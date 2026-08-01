@@ -19,7 +19,7 @@ Full guide: https://github.com/felipefdl/thatsmatter/blob/main/docs/haos-install
 | Listen port | 18465 | Integration IPC |
 | Matter backend | rs_matter | Use `dev` only for offline IPC tests |
 | Log level | info | Bridge logs |
-| LAN interface | _(empty)_ | Optional host interface name (`eth0`, `enp1s0`, `wlan0`). Empty = auto-select like Matterbridge (skips Docker/hassio faces). Set when multiple NICs break HomeKit/controller discovery. |
+| LAN interface | _(empty)_ | Host interface name (`eth0`, `enp1s0`, `wlan0`) that Matter **reports/requires as operational** for the stack netif view. Empty = auto-select the best non-virtual face **with IPv6** (link-local OK; skips Docker/hassio). A wrong pin fails start with available names. Does **not** force Avahi to a single NIC — Avahi multi-homes per host Avahi policy unless you configure Avahi separately. |
 
 ## Pairing and devices
 
@@ -30,10 +30,11 @@ Use the integration **Configure** menu (not YAML):
 
 ### Multi-NIC / HomeKit tips
 
-1. **Stop Matterbridge** (or any other Matter accessory on UDP **5540**) before pairing ThatsMatter on the same host.
-2. Prefer **Avahi** on the host (this App has `host_dbus` and uses system Avahi when available).
-3. If controllers never see the bridge, set **LAN interface** to your real Ethernet/Wi‑Fi name and **restart** the App. Check logs for `LAN netif inventory` / `selected Matter LAN interface`.
-4. Do **not** keep re-opening the pairing window while it is already open — the bridge treats that as a no-op so the stack window is not thrashed.
+1. **Stop Matterbridge** (or any other Matter accessory on UDP **5540**) before starting/pairing ThatsMatter on the same host — the bridge preflights 5540 and will refuse to start if the port is taken.
+2. Controllers (phone, hub, HA Matter Server) must share the **same L2 LAN** as the selected interface. Matter needs **IPv6 on that face** (link-local `fe80::` is enough).
+3. Prefer a working **Avahi** daemon on the host (this App has `host_dbus`). The bridge probes Avahi over D-Bus before using it; if the probe fails it falls back to Zeroconf — on Linux/HAOS both paths typically still need the Avahi daemon.
+4. If controllers never see the bridge, set **LAN interface** to your real Ethernet/Wi‑Fi name and **restart** the App. Check logs for `LAN netif inventory` and `Matter LAN interface …`. That option only steers the Matter stack's netif view; Avahi advertisement multi-homing is still host Avahi policy.
+5. Do **not** keep re-opening the pairing window while it is already open — the bridge treats that as a true no-op (deadline unchanged). If another admin window is active (e.g. controller ECM), open returns an error instead of closing that foreign window.
 
 ### Multi-admin pairing
 
