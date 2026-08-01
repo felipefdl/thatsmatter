@@ -43,15 +43,6 @@ from .export_manager import (
 )
 from .helpers import SUPPORTED_DOMAINS
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_BRIDGE_HOST, default=DEFAULT_BRIDGE_HOST): str,
-        vol.Required(CONF_BRIDGE_PORT, default=DEFAULT_BRIDGE_PORT): int,
-        vol.Required(CONF_BRIDGE_NAME, default=DEFAULT_BRIDGE_NAME): str,
-    }
-)
-
-
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate bridge host/port/name and return entry fields."""
     host = data[CONF_BRIDGE_HOST].strip()
