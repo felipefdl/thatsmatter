@@ -12,6 +12,7 @@ mkdir -p "${OUT}/thatsmatter"
 
 cp -a "${APP_SRC}/config.yaml" "${OUT}/thatsmatter/"
 cp -a "${APP_SRC}/DOCS.md" "${OUT}/thatsmatter/"
+cp -a "${APP_SRC}/CHANGELOG.md" "${OUT}/thatsmatter/"
 cp -a "${APP_SRC}/README.md" "${OUT}/thatsmatter/"
 cp -a "${APP_SRC}/run.sh" "${OUT}/thatsmatter/"
 cp -a "${APP_SRC}/Dockerfile" "${OUT}/thatsmatter/" 2>/dev/null || true
