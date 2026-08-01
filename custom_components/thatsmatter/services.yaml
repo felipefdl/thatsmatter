@@ -1,0 +1,124 @@
+add_export:
+  name: Add export
+  description: Add a Home Assistant entity to the ThatsMatter export catalog with defaults from the product type table.
+  fields:
+    entity_id:
+      name: Entity
+      description: Primary HA entity to export.
+      required: true
+      selector:
+        entity: {}
+    name:
+      name: Matter name
+      description: Name controllers will see. Defaults to the HA friendly name.
+      selector:
+        text:
+    type:
+      name: Device type
+      description: Matter device type key (light, on_off_switch, outlet, cover, ...). Defaults from domain and device class.
+      selector:
+        select:
+          options:
+            - light
+            - on_off_switch
+            - on_off_plug
+            - outlet
+            - contact
+            - motion
+            - cover
+            - garage
+    area_id:
+      name: Area
+      description: Optional area override. Defaults from the entity area.
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      description: Whether the export is active. Defaults to true.
+      default: true
+      selector:
+        boolean:
+    linked:
+      name: Linked entities
+      description: Optional map of role to entity_id (battery, brightness, position).
+      selector:
+        object:
+
+update_export:
+  name: Update export
+  description: Update fields on an existing export.
+  fields:
+    export_id:
+      name: Export ID
+      description: Stable export UUID.
+      required: true
+      selector:
+        text:
+    name:
+      name: Matter name
+      selector:
+        text:
+    type:
+      name: Device type
+      selector:
+        select:
+          options:
+            - light
+            - on_off_switch
+            - on_off_plug
+            - outlet
+            - contact
+            - motion
+            - cover
+            - garage
+    primary_entity_id:
+      name: Primary entity
+      selector:
+        entity: {}
+    area_id:
+      name: Area
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      selector:
+        boolean:
+    linked:
+      name: Linked entities
+      selector:
+        object:
+
+remove_export:
+  name: Remove export
+  description: Permanently remove an export from the catalog.
+  fields:
+    export_id:
+      name: Export ID
+      required: true
+      selector:
+        text:
+
+set_enabled:
+  name: Set enabled
+  description: Soft enable or disable an export without deleting its config.
+  fields:
+    export_id:
+      name: Export ID
+      required: true
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      required: true
+      selector:
+        boolean:
+
+reset_name_from_ha:
+  name: Reset name from Home Assistant
+  description: Copy the current HA friendly name onto the Matter advertised name.
+  fields:
+    export_id:
+      name: Export ID
+      required: true
+      selector:
+        text:

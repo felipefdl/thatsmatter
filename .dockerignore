@@ -1,0 +1,11 @@
+**/target
+**/.venv*
+**/__pycache__
+**/.pytest_cache
+**/dist
+**/.git
+**/.grok
+**/data
+**/*.md
+!addons/thatsmatter/DOCS.md
+!addons/thatsmatter/README.md

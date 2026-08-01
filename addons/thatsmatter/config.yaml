@@ -1,0 +1,44 @@
+name: ThatsMatter
+version: "0.1.0"
+slug: thatsmatter
+description: >-
+  Local Matter bridge for Home Assistant. Exposes selected entities to Matter
+  controllers (Alexa, Google Home, SmartThings, Apple Home). Pairing and
+  catalog are managed by the ThatsMatter integration (HACS or custom_components).
+url: https://github.com/felipefdl/thatsmatter
+arch:
+  - aarch64
+  - amd64
+image: ghcr.io/felipefdl/thatsmatter
+init: false
+startup: services
+boot: auto
+stage: experimental
+host_network: true
+host_dbus: true
+hassio_api: true
+homeassistant_api: false
+auth_api: false
+ingress: false
+map:
+  - type: data
+    read_only: false
+options:
+  bridge_name: ThatsMatter
+  listen_port: 18465
+  matter_backend: rs_matter
+  log_level: info
+schema:
+  bridge_name: str
+  listen_port: port
+  matter_backend: list(rs_matter|dev)
+  log_level: list(trace|debug|info|warn|error)
+ports:
+  18465/tcp: 18465
+ports_description:
+  18465/tcp: Bridge HTTP control plane (integration IPC)
+watchdog: tcp://[HOST]:[PORT:18465]
+discovery:
+  - thatsmatter
+panel_icon: mdi:chip
+panel_title: ThatsMatter

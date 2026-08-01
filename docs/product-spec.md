@@ -91,36 +91,25 @@ Copy that should stay visible:
 - You set the name and type each controller sees.
 - Controllers may keep their own name after first pairing.
 
-### Catalog (main screen)
+### Catalog (Configure UI)
 
-List of exports:
+Primary path is the integration **Configure** options flow (no YAML, no Developer Tools services):
 
-| Column | Content |
-|---|---|
-| Name (Matter) | What controllers are told |
-| Type | Light, On/Off plug, Switch, … |
-| Source | Primary HA entity id |
-| Area | HA area or override |
-| Status | OK / disabled / missing entity |
+1. **Add devices to export** — HA entity multi-select + optional type override  
+2. **Manage exported devices** — rename, type, enable/disable, remove  
+3. **Pair with other apps** — setup code + link to QR image entity  
+4. Connection settings (host/port) for advanced installs  
 
-Actions:
+Services remain available for automations; they are not required for normal use.
 
-- Add
-- Search / filter by type, area, status
-- Open export editor
-- Enable / disable (soft remove without deleting config)
-- Delete
-
-This list is the answer to “what is exposed?”
+This list (and Manage UI) is the answer to “what is exposed?”
 
 ### Add flow
 
-1. **Add** opens HA entity / device picker (searchable multi-select).
-2. Optional bootstrap (secondary): “Import entities with label X” or “Import area Y” seeds the catalog; user still reviews rows.
-3. Each selection creates an export with defaults (see Defaults).
-4. User lands back on the catalog (or directly into editor if single add).
-
-Primary path is explicit picks. Filters are not the main product.
+1. **Configure → Add devices to export**  
+2. Pick one or more entities (lights, switches, covers, contact/motion sensors)  
+3. Optional Matter type (default Automatic)  
+4. Submit — each entity becomes an export with friendly-name defaults  
 
 ### Export editor (core product)
 
@@ -197,10 +186,10 @@ Rationale:
 - Rust (`rs-matter`) is the preferred protocol implementation when viable.
 - Python owns UX, entity mapping, and HA lifecycle.
 
-Packaging (decide at implementation time):
+Packaging:
 
-- Custom integration for UI and config
-- Bridge binary as HAOS add-on / app and/or supervised sidecar with host network
+- Custom integration for UI and config (`custom_components/thatsmatter`)
+- Bridge as HAOS App under `homeassistant/thatsmatter` (host network); package with `scripts/package-haos.sh`
 
 ### Export storage (logical)
 

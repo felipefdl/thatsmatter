@@ -1,0 +1,144 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "ThatsMatter",
+        "description": "Connect to the ThatsMatter bridge App. Local only. Nothing is exposed until you add devices under Configure.",
+        "data": {
+          "bridge_host": "Bridge host",
+          "bridge_port": "Bridge port",
+          "bridge_name": "Bridge display name"
+        },
+        "data_description": {
+          "bridge_host": "Usually 127.0.0.1 when the ThatsMatter App runs on HAOS.",
+          "bridge_port": "IPC port (default 18465).",
+          "bridge_name": "Name of the Matter bridge node."
+        }
+      },
+      "hassio_confirm": {
+        "title": "ThatsMatter App discovered",
+        "description": "Found the ThatsMatter App.\n\nHost: `{host}`\nPort: `{port}`\nName: `{name}`\n\nConfirm to connect."
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the bridge.",
+      "invalid_host": "Invalid host, port, or bridge name.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "ThatsMatter is already configured.",
+      "invalid_host": "Invalid discovery host."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ThatsMatter",
+        "menu_options": {
+          "pairing": "Pair with other apps (Alexa, Google, Apple, …)",
+          "add_export": "Add devices to export",
+          "manage_exports": "Manage exported devices",
+          "connection": "Bridge connection settings"
+        }
+      },
+      "pairing": {
+        "title": "Pair with other apps",
+        "description": "### Setup code\n\n# `{setup_code}`\n\n1. Open **Alexa**, **Google Home**, **SmartThings**, or **Apple Home**\n2. **Add device** → **Matter** (not a cloud skill)\n3. Enter the setup code above, or scan the **Pairing QR code** image on the ThatsMatter device page in Home Assistant\n\nQR payload: `{qr_payload}`\n\nA notification with this code is also shown in Home Assistant.\n\nNothing is shared until you use **Add devices to export**."
+      },
+      "add_export": {
+        "title": "Add devices to export",
+        "description": "Pick lights, switches, covers, or contact/motion sensors. Names default from Home Assistant. Optional type override; leave Automatic for smart defaults.\n\n{error_detail}",
+        "data": {
+          "entities": "Devices / entities",
+          "type": "Matter type"
+        }
+      },
+      "add_done": {
+        "title": "Devices added",
+        "description": "Exported **{count}** device(s): {names}\n\nThey appear in other apps after you pair the bridge (see **Pair with other apps**)."
+      },
+      "manage_exports": {
+        "title": "Manage exported devices",
+        "description": "Select a device to rename, change type, enable/disable, or remove.",
+        "data": {
+          "export_id": "Exported device"
+        }
+      },
+      "manage_empty": {
+        "title": "No devices exported yet",
+        "description": "Nothing is shared with Alexa/Google/Apple until you add devices. Submit to open **Add devices**."
+      },
+      "edit_export": {
+        "title": "Edit export",
+        "description": "Home Assistant entity: `{entity_id}`\n\nChange how this device appears on Matter controllers.",
+        "data": {
+          "name": "Name in Alexa / Google / Apple",
+          "type": "Matter type",
+          "enabled": "Enabled (shared)",
+          "action": "Action"
+        }
+      },
+      "connection": {
+        "title": "Bridge connection",
+        "description": "Advanced: where the ThatsMatter App is listening.",
+        "data": {
+          "bridge_host": "Bridge host",
+          "bridge_port": "Bridge port",
+          "bridge_name": "Bridge display name"
+        }
+      }
+    },
+    "error": {
+      "add_failed": "Could not add one or more devices. Check the description.",
+      "update_failed": "Could not update that export."
+    },
+    "abort": {
+      "not_configured": "ThatsMatter is not loaded."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "bridge_status": {
+        "name": "Bridge status"
+      },
+      "pairing_code": {
+        "name": "Setup code"
+      },
+      "export_count": {
+        "name": "Export count"
+      }
+    },
+    "binary_sensor": {
+      "bridge_connected": {
+        "name": "Bridge connected"
+      }
+    },
+    "image": {
+      "pairing_qr": {
+        "name": "Pairing QR code"
+      }
+    }
+  },
+  "services": {
+    "add_export": {
+      "name": "Add export",
+      "description": "Add a Home Assistant entity to the export catalog (prefer Configure UI)."
+    },
+    "update_export": {
+      "name": "Update export",
+      "description": "Update fields on an existing export."
+    },
+    "remove_export": {
+      "name": "Remove export",
+      "description": "Permanently remove an export from the catalog."
+    },
+    "set_enabled": {
+      "name": "Set enabled",
+      "description": "Soft enable or disable an export without deleting its config."
+    },
+    "reset_name_from_ha": {
+      "name": "Reset name from Home Assistant",
+      "description": "Copy the current HA friendly name onto the Matter advertised name."
+    }
+  }
+}

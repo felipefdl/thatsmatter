@@ -1,0 +1,50 @@
+# Rust
+bridge/target/
+target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.venv-test/
+venv/
+.env
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+coverage.xml
+
+# Runtime
+.storage/
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Build / packaging
+dist/
+build/
+*.egg
+
+# Grok / agent local
+.grok/
+
+# Docker HA config seed runtime (keep configuration.yaml only)
+docker/ha-config/*
+!docker/ha-config/configuration.yaml

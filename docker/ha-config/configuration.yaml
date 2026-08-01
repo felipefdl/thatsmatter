@@ -1,0 +1,11 @@
+# Minimal Home Assistant config for the ThatsMatter Docker loop.
+
+default_config:
+
+demo:
+
+logger:
+  default: info
+  logs:
+    custom_components.thatsmatter: debug
+    homeassistant.components.matter: debug

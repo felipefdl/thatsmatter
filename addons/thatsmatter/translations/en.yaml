@@ -1,0 +1,15 @@
+configuration:
+  bridge_name:
+    name: Bridge name
+    description: Name shown for the Matter bridge node and diagnostics
+  listen_port:
+    name: Listen port
+    description: HTTP control plane port for the ThatsMatter integration (default 18465)
+  matter_backend:
+    name: Matter backend
+    description: "rs_matter = commissionable Matter stack; dev = offline IPC only"
+  log_level:
+    name: Log level
+    description: Logging verbosity for the bridge process
+network:
+  18465/TCP: ThatsMatter integration control plane (HTTP JSON)

@@ -1,0 +1,58 @@
+# ThatsMatter local loop: Home Assistant + Matter Server + bridge.
+#
+# Usage:
+#   docker compose up --build
+#
+# Then open HA at http://localhost:8123, install ThatsMatter (pre-mounted),
+# configure bridge host `thatsmatter-bridge` port 18465, add an export for a
+# demo light, and commission the bridge into the Matter integration using
+# the setup code from the ThatsMatter pairing sensor (or GET /pairing).
+#
+# On Docker Desktop (macOS), Matter mDNS/multicast may fail. Capture that as
+# an environment limitation; IPC and catalog still work on the compose network.
+
+services:
+  thatsmatter-bridge:
+    build:
+      context: .
+      dockerfile: docker/bridge.Dockerfile
+    container_name: thatsmatter-bridge
+    environment:
+      THATSMATTER_LISTEN: "127.0.0.1:18465"
+      THATSMATTER_DATA_DIR: /data
+      THATSMATTER_BRIDGE_NAME: ThatsMatter
+      THATSMATTER_MATTER_BACKEND: rs_matter
+      RUST_LOG: info
+    volumes:
+      - bridge-data:/data
+    # Matter needs host networking for mDNS on Linux; on Mac this is limited.
+    network_mode: host
+    restart: unless-stopped
+
+  matter-server:
+    image: ghcr.io/matter-js/python-matter-server:stable
+    container_name: thatsmatter-matter-server
+    # Official Matter Server needs host network for commissioning discovery.
+    network_mode: host
+    volumes:
+      - matter-server-data:/data
+    restart: unless-stopped
+    # Only start when host network works (Linux / HAOS). On Docker Desktop Mac,
+    # `docker compose up matter-server` may still run but discovery can fail.
+    profiles: ["matter"]
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: thatsmatter-homeassistant
+    network_mode: host
+    environment:
+      TZ: America/New_York
+    volumes:
+      - ./docker/ha-config:/config
+      - ./custom_components/thatsmatter:/config/custom_components/thatsmatter:ro
+    restart: unless-stopped
+    profiles: ["ha"]
+
+volumes:
+  bridge-data:
+  matter-server-data:

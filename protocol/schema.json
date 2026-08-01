@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thatsmatter.local/protocol/schema.json",
+  "title": "ThatsMatter IPC",
+  "description": "JSON Schema for the loopback HTTP IPC between the Home Assistant custom component and the ThatsMatter bridge process. Transport: HTTP/1.1 JSON on 127.0.0.1 only (default port 18465). HA is the client; the bridge is the server. HA owns the export catalog; the bridge assigns endpoint_id and hosts Matter (or Dev) backend state.",
+  "definitions": {
+    "DeviceType": {
+      "type": "string",
+      "enum": [
+        "light",
+        "on_off_switch",
+        "on_off_plug",
+        "outlet",
+        "contact",
+        "motion",
+        "cover",
+        "garage"
+      ]
+    },
+    "LinkedRole": {
+      "type": "string",
+      "enum": ["battery", "brightness", "position"],
+      "description": "Known linked-entity role keys. Wire maps may include other string keys; first-ship helpers use these."
+    },
+    "Export": {
+      "type": "object",
+      "required": [
+        "export_id",
+        "name",
+        "type",
+        "primary_entity_id",
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "export_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Stable export identity. Never the HA entity_id."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "type": {
+          "$ref": "#/definitions/DeviceType"
+        },
+        "primary_entity_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "linked": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Map of role key (see LinkedRole) to entity_id. Empty object default."
+        },
+        "area_id": {
+          "type": ["string", "null"]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "endpoint_id": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Matter endpoint id assigned by the bridge; null until assigned."
+        }
+      }
+    },
+    "CreateExport": {
+      "type": "object",
+      "required": ["name", "type", "primary_entity_id"],
+      "additionalProperties": false,
+      "description": "Body for POST /exports. Bridge assigns export_id when omitted and always assigns endpoint_id on create.",
+      "properties": {
+        "export_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Optional client-supplied id (HA always sends one). Bridge generates a UUID if omitted."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "type": {
+          "$ref": "#/definitions/DeviceType"
+        },
+        "primary_entity_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "linked": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "area_id": {
+          "type": ["string", "null"]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "PatchExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Body for PATCH /exports/{id}. All fields optional. endpoint_id is never patched (stable once assigned). area_id may be set to null to clear.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "type": {
+          "$ref": "#/definitions/DeviceType"
+        },
+        "primary_entity_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "linked": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "area_id": {
+          "type": ["string", "null"]
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "CatalogSnapshot": {
+      "type": "object",
+      "required": ["exports", "bridge_name"],
+      "additionalProperties": false,
+      "description": "Full catalog used for persistence and internal replace. HTTP surface uses per-export CRUD; HA reconciles via create/patch/delete.",
+      "properties": {
+        "bridge_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "exports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Export"
+          }
+        }
+      }
+    },
+    "BridgeStatus": {
+      "type": "object",
+      "required": [
+        "bridge_name",
+        "running",
+        "matter_backend",
+        "pairing_open",
+        "export_count",
+        "enabled_export_count",
+        "error"
+      ],
+      "additionalProperties": false,
+      "description": "GET /status body.",
+      "properties": {
+        "bridge_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "matter_backend": {
+          "type": "string",
+          "enum": ["rs_matter", "dev"]
+        },
+        "pairing_open": {
+          "type": "boolean"
+        },
+        "export_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "enabled_export_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "PairingMaterial": {
+      "type": "object",
+      "required": ["setup_code", "qr_payload", "discriminator", "passcode"],
+      "additionalProperties": false,
+      "description": "GET /pairing body.",
+      "properties": {
+        "setup_code": {
+          "type": "string",
+          "description": "Manual Matter setup / pairing code shown in HA."
+        },
+        "qr_payload": {
+          "type": "string",
+          "description": "Matter QR payload string for rendering in HA."
+        },
+        "discriminator": {
+          "type": "integer"
+        },
+        "passcode": {
+          "type": "integer"
+        }
+      }
+    },
+    "HaStateValue": {
+      "type": "object",
+      "required": ["entity_id", "state"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "HaStateUpdate": {
+      "type": "object",
+      "required": ["states"],
+      "additionalProperties": false,
+      "description": "HA pushes entity state to the bridge (POST /exports/{id}/state). A single HaStateValue is also accepted.",
+      "properties": {
+        "states": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HaStateValue"
+          }
+        }
+      }
+    },
+    "CommandKind": {
+      "type": "string",
+      "enum": [
+        "on_off",
+        "level",
+        "cover_position",
+        "cover_open",
+        "cover_close",
+        "cover_stop"
+      ]
+    },
+    "CommandRequest": {
+      "type": "object",
+      "required": ["export_id", "kind"],
+      "additionalProperties": false,
+      "description": "Command event from a Matter controller, pending HA execution (GET /commands drains the queue).",
+      "properties": {
+        "export_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/definitions/CommandKind"
+        },
+        "on": {
+          "type": "boolean"
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 254
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "CommandResult": {
+      "type": "object",
+      "required": ["accepted", "export_id", "kind"],
+      "additionalProperties": false,
+      "description": "Reserved for future command ack from HA to the bridge. Not an active HTTP body yet; commands are drained via GET /commands only.",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "export_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/definitions/CommandKind"
+        },
+        "error": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "HealthResponse": {
+      "type": "object",
+      "required": ["ok", "version"],
+      "additionalProperties": false,
+      "description": "GET /health body.",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "StatePushResult": {
+      "type": "object",
+      "required": ["applied"],
+      "additionalProperties": false,
+      "description": "POST /exports/{id}/state response.",
+      "properties": {
+        "applied": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PendingCommands": {
+      "type": "object",
+      "required": ["commands"],
+      "additionalProperties": false,
+      "description": "GET /commands body (drains the queue).",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CommandRequest"
+          }
+        }
+      }
+    },
+    "ErrorBody": {
+      "type": "object",
+      "required": ["error", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "FabricResetRequest": {
+      "type": "object",
+      "required": ["confirm"],
+      "additionalProperties": false,
+      "description": "Reserved for future fabric reset. Not an active HTTP body yet.",
+      "properties": {
+        "confirm": {
+          "const": true
+        }
+      }
+    }
+  }
+}
