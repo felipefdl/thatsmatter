@@ -24,6 +24,15 @@ pub trait MatterBackend: Send + Sync {
   /// Whether commissioning / pairing window is open.
   async fn pairing_open(&self) -> bool;
 
+  /// Open the basic commissioning window for `timeout_secs` (clamped 180..=900).
+  async fn open_pairing_window(&self, timeout_secs: u16) -> anyhow::Result<()>;
+
+  /// Close any window this bridge opened.
+  async fn close_pairing_window(&self) -> anyhow::Result<()>;
+
+  /// Number of commissioned fabrics currently known to the backend.
+  async fn commissioned_fabrics(&self) -> u8;
+
   /// Push the current export set into the Matter node (dynamic endpoints).
   async fn set_exports(&self, exports: &[Export]) -> anyhow::Result<()>;
 
@@ -38,4 +47,27 @@ pub trait MatterBackend: Send + Sync {
 
   /// Optional last error string for `/status`.
   async fn status_error(&self) -> Option<String>;
+}
+
+/// Default open-window timeout when the client omits `timeout_secs`.
+pub const PAIRING_TIMEOUT_DEFAULT_SECS: u16 = 300;
+/// Spec minimum for a basic commissioning window (`rs-matter` rejects below this).
+pub const PAIRING_TIMEOUT_MIN_SECS: u16 = 180;
+/// Spec maximum for a basic commissioning window.
+pub const PAIRING_TIMEOUT_MAX_SECS: u16 = 900;
+/// Startup window when the node has no fabrics yet (matches stack `startup`).
+pub const STARTUP_PAIRING_TIMEOUT_SECS: u64 = 900;
+
+/// Clamp a requested pairing-window timeout into the Matter 180..=900 range.
+pub fn clamp_pairing_timeout(timeout_secs: u16) -> u16 {
+  timeout_secs.clamp(PAIRING_TIMEOUT_MIN_SECS, PAIRING_TIMEOUT_MAX_SECS)
+}
+
+/// Unix epoch seconds for window-deadline atomics.
+pub fn epoch_secs() -> u64 {
+  use std::time::{SystemTime, UNIX_EPOCH};
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs())
+    .unwrap_or(0)
 }

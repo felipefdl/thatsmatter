@@ -167,6 +167,7 @@
         "running",
         "matter_backend",
         "pairing_open",
+        "commissioned_fabrics",
         "export_count",
         "enabled_export_count",
         "error"
@@ -187,7 +188,14 @@
           "enum": ["rs_matter", "dev"]
         },
         "pairing_open": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Whether the bridge-tracked basic commissioning window is open."
+        },
+        "commissioned_fabrics": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Number of commissioned fabrics known to the Matter backend."
         },
         "export_count": {
           "type": "integer",
@@ -199,6 +207,48 @@
         },
         "error": {
           "type": ["string", "null"]
+        }
+      }
+    },
+    "OpenPairingRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional body for POST /pairing/open. Empty body uses defaults.",
+      "properties": {
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 300,
+          "description": "Requested window duration; bridge clamps to 180..=900."
+        }
+      }
+    },
+    "OpenPairingResponse": {
+      "type": "object",
+      "required": ["pairing_open", "timeout_secs"],
+      "additionalProperties": false,
+      "description": "POST /pairing/open response.",
+      "properties": {
+        "pairing_open": {
+          "const": true
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 180,
+          "maximum": 900,
+          "description": "Clamped timeout applied to the open window."
+        }
+      }
+    },
+    "ClosePairingResponse": {
+      "type": "object",
+      "required": ["pairing_open"],
+      "additionalProperties": false,
+      "description": "POST /pairing/close response.",
+      "properties": {
+        "pairing_open": {
+          "const": false
         }
       }
     },

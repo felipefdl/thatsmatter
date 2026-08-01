@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import datetime
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.config_entries import ConfigEntry
@@ -104,4 +103,6 @@ class ThatsMatterPairingQrImage(ImageEntity):
 
     @property
     def available(self) -> bool:
-        return bool(self._runtime.pairing.get("qr_payload"))
+        return self._runtime.pairing_window_open and bool(
+            self._runtime.pairing.get("qr_payload")
+        )

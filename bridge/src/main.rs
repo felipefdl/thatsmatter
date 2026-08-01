@@ -24,14 +24,14 @@ async fn main() -> anyhow::Result<()> {
 
   let backend: Arc<dyn MatterBackend> = match cfg.matter_backend {
     BackendKind::Dev => {
-      let b = Arc::new(DevMatterBackend::new(&cfg.data_dir));
+      let b = Arc::new(DevMatterBackend::new(&cfg.data_dir)?);
       b.start().await?;
       let exports = catalog.list();
       b.set_exports(&exports).await?;
       b
     }
     BackendKind::RsMatter => {
-      let b = Arc::new(RsMatterBackend::new(&cfg.data_dir));
+      let b = Arc::new(RsMatterBackend::new(&cfg.data_dir)?);
       b.start().await?;
       let exports = catalog.list();
       b.set_exports(&exports).await?;

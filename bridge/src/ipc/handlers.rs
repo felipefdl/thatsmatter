@@ -8,8 +8,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use uuid::Uuid;
 
-use super::types::{BridgeStatus, ErrorBody, HealthResponse, PendingCommands};
+use super::types::{
+  BridgeStatus, ClosePairingResponse, ErrorBody, HealthResponse, OpenPairingRequest, OpenPairingResponse,
+  PendingCommands,
+};
 use crate::catalog::{CatalogError, CreateExport, Export, HaStateUpdate, HaStateValue, PatchExport, StatePushResult};
+use crate::matter::clamp_pairing_timeout;
 use crate::state::AppState;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -77,12 +81,14 @@ pub async fn status(State(state): State<SharedState>) -> Response {
   };
   let running = state.backend.is_running().await;
   let pairing_open = state.backend.pairing_open().await;
+  let commissioned_fabrics = state.backend.commissioned_fabrics().await;
   let error = state.backend.status_error().await;
   Json(BridgeStatus {
     bridge_name,
     running,
     matter_backend: state.backend_kind.as_wire_str().to_string(),
     pairing_open,
+    commissioned_fabrics,
     export_count,
     enabled_export_count,
     error,
@@ -94,6 +100,46 @@ pub async fn status(State(state): State<SharedState>) -> Response {
 pub async fn pairing(State(state): State<SharedState>) -> Response {
   let material = state.backend.pairing_info().await;
   Json(material).into_response()
+}
+
+/// `POST /pairing/open` — open the basic commissioning window.
+///
+/// Body is optional; default timeout is 300s, clamped to 180..=900.
+pub async fn open_pairing(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+  let req = if body.is_empty() {
+    OpenPairingRequest::default()
+  } else {
+    match serde_json::from_slice::<OpenPairingRequest>(&body) {
+      Ok(r) => r,
+      Err(err) => {
+        return (
+          StatusCode::BAD_REQUEST,
+          Json(ErrorBody {
+            error: "invalid".into(),
+            message: format!("invalid open pairing body: {err}"),
+          }),
+        )
+          .into_response();
+      }
+    }
+  };
+  let timeout_secs = clamp_pairing_timeout(req.timeout_secs);
+  match state.backend.open_pairing_window(timeout_secs).await {
+    Ok(()) => Json(OpenPairingResponse {
+      pairing_open: true,
+      timeout_secs,
+    })
+    .into_response(),
+    Err(e) => internal(e.to_string()),
+  }
+}
+
+/// `POST /pairing/close` — close any window this bridge opened.
+pub async fn close_pairing(State(state): State<SharedState>) -> Response {
+  match state.backend.close_pairing_window().await {
+    Ok(()) => Json(ClosePairingResponse { pairing_open: false }).into_response(),
+    Err(e) => internal(e.to_string()),
+  }
 }
 
 /// `GET /exports`

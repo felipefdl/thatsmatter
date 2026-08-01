@@ -214,3 +214,60 @@ def ha_brightness_to_matter_level(brightness: int) -> int:
     if brightness >= 255:
         return 254
     return max(1, (brightness * 254) // 255)
+
+
+def pairing_credentials_for_display(
+    *,
+    open_ok: bool,
+    pairing_open: bool,
+    pairing: dict[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return (setup_code, qr_payload) only when open succeeded and status is open.
+
+    Withholds credentials on open failure, closed window, or missing material so
+    the options flow never shows a code that cannot commission.
+    """
+    if not open_ok or not pairing_open:
+        return None
+    material = pairing or {}
+    code = material.get("setup_code")
+    qr = material.get("qr_payload")
+    if not code or not qr:
+        return None
+    return str(code), str(qr)
+
+
+def should_show_pairing_notification(
+    *,
+    bridge_connected: bool,
+    pairing_open: bool,
+    has_setup_code: bool,
+) -> bool:
+    """Whether the persistent pairing notification should remain visible."""
+    return bool(bridge_connected and pairing_open and has_setup_code)
+
+
+def pairing_notification_action(
+    *,
+    bridge_connected: bool,
+    pairing_open: bool,
+    setup_code: str | None,
+    last_notified_code: str | None,
+) -> str:
+    """Decide how to reconcile the pairing drawer notification.
+
+    Returns one of:
+    - ``\"dismiss\"`` — window closed, bridge disconnected, or no setup code
+    - ``\"create\"`` — show (or refresh) the notification for a new code
+    - ``\"noop\"`` — already showing this code; leave the drawer alone
+    """
+    if not should_show_pairing_notification(
+        bridge_connected=bridge_connected,
+        pairing_open=pairing_open,
+        has_setup_code=bool(setup_code),
+    ):
+        return "dismiss"
+    code_s = str(setup_code)
+    if code_s == last_notified_code:
+        return "noop"
+    return "create"

@@ -16,6 +16,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     .route("/health", get(handlers::health))
     .route("/status", get(handlers::status))
     .route("/pairing", get(handlers::pairing))
+    .route("/pairing/open", post(handlers::open_pairing))
+    .route("/pairing/close", post(handlers::close_pairing))
     .route("/exports", get(handlers::list_exports).post(handlers::create_export))
     .route(
       "/exports/{id}",

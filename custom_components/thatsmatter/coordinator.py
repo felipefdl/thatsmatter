@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -20,7 +21,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .bridge_client import BridgeClient, BridgeClientError
 from .const import COMMAND_POLL_INTERVAL, DOMAIN, STATUS_POLL_INTERVAL
-from .helpers import ha_state_value, matter_level_to_ha_brightness
+from .helpers import (
+    ha_state_value,
+    matter_level_to_ha_brightness,
+    pairing_notification_action,
+)
 from .models import Export
 from .store import ExportStore
 
@@ -125,14 +130,48 @@ class ThatsMatterRuntime:
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("ThatsMatter listener failed")
 
+    @property
+    def pairing_window_open(self) -> bool:
+        """Whether the bridge reports an open basic commissioning window."""
+        return bool(self.bridge_status.get("pairing_open"))
+
+    async def async_open_pairing_window(self, timeout_secs: int = 300) -> None:
+        """Open the pairing window, refresh status/material, notify listeners."""
+        client = self._require_client()
+        await client.open_pairing(timeout_secs)
+        await self.async_refresh_status()
+        await self.async_refresh_pairing()
+        await self.async_show_pairing_notification()
+        self.notify_listeners()
+
+    async def async_dismiss_pairing_notification(self) -> None:
+        """Remove the pairing drawer entry and allow a later re-notify of the same code."""
+        self._last_notified_code = None
+        from homeassistant.components.persistent_notification import (
+            async_dismiss as async_dismiss_notification,
+        )
+
+        async_dismiss_notification(self.hass, self._pairing_notice_id)
+
     async def async_show_pairing_notification(self) -> None:
-        """Surface pairing code in the HA notification drawer (no YAML / host shell)."""
+        """Surface pairing code in the HA notification drawer while the window is open.
+
+        Dismisses the notification when the window is closed, the bridge is
+        disconnected, or pairing material is unavailable.
+        """
         code = self.pairing.get("setup_code")
-        if not code:
+        action = pairing_notification_action(
+            bridge_connected=self.bridge_connected,
+            pairing_open=self.pairing_window_open,
+            setup_code=str(code) if code else None,
+            last_notified_code=self._last_notified_code,
+        )
+        if action == "dismiss":
+            await self.async_dismiss_pairing_notification()
+            return
+        if action == "noop":
             return
         code_s = str(code)
-        if code_s == self._last_notified_code:
-            return
         self._last_notified_code = code_s
         message = (
             f"**ThatsMatter is ready to pair**\n\n"
@@ -141,6 +180,9 @@ class ThatsMatterRuntime:
             f"**Add device → Matter**, then enter this code (or open "
             f"**Settings → Devices & services → ThatsMatter → Configure → Pair with other apps** "
             f"to see the QR code).\n\n"
+            f"The pairing window stays open for a few minutes. Press **Open pairing window** "
+            f"on the ThatsMatter device if it closed. Already-paired apps can also share the "
+            f"bridge via Home Assistant's Matter **share device** flow.\n\n"
             f"Nothing is shared until you add devices under **Configure → Add devices**."
         )
         from homeassistant.components.persistent_notification import (
@@ -164,12 +206,11 @@ class ThatsMatterRuntime:
         for task in (self._command_task, self._status_task):
             if task is not None and not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
         self._command_task = None
         self._status_task = None
+        await self.async_dismiss_pairing_notification()
 
     def _require_client(self) -> BridgeClient:
         if self.client is None:
@@ -194,8 +235,10 @@ class ThatsMatterRuntime:
             raise
 
     async def async_refresh_status(self) -> None:
-        """Refresh bridge status snapshot."""
+        """Refresh bridge status snapshot and notify listeners on any change."""
         client = self._require_client()
+        was_connected = self.bridge_connected
+        previous_status = self.bridge_status
         try:
             self.bridge_status = await client.status()
             self.bridge_connected = True
@@ -204,16 +247,23 @@ class ThatsMatterRuntime:
             self.bridge_connected = False
             self.last_error = str(err)
             self.bridge_status = {}
+        if (
+            self.bridge_connected != was_connected
+            or self.bridge_status != previous_status
+        ):
+            self.notify_listeners()
 
     async def async_refresh_pairing(self) -> None:
-        """Refresh pairing material for UI entities."""
+        """Refresh pairing material and notify listeners when it changes."""
         client = self._require_client()
+        previous_pairing = self.pairing
         try:
             self.pairing = await client.pairing()
-            self.notify_listeners()
         except BridgeClientError as err:
             _LOGGER.debug("Pairing refresh failed: %s", err)
             self.pairing = {}
+        if self.pairing != previous_pairing:
+            self.notify_listeners()
 
     async def async_push_all_states(self) -> None:
         """Push current HA state for every enabled export."""
@@ -282,9 +332,9 @@ class ThatsMatterRuntime:
     async def _command_loop(self) -> None:
         """Poll bridge commands and execute HA services."""
         while self._started:
+            was_connected = self.bridge_connected
             try:
                 if self.client is not None:
-                    was_connected = self.bridge_connected
                     commands = await self.client.take_commands()
                     self.bridge_connected = True
                     self.last_error = None
@@ -292,6 +342,7 @@ class ThatsMatterRuntime:
                         # This loop polls faster than the status loop, so it is
                         # usually the first to observe a reconnect.
                         await self._async_on_reconnected()
+                        self.notify_listeners()
                     for cmd in commands:
                         await self._async_execute_command(cmd)
             except asyncio.CancelledError:
@@ -299,6 +350,8 @@ class ThatsMatterRuntime:
             except BridgeClientError as err:
                 self.bridge_connected = False
                 self.last_error = str(err)
+                if was_connected:
+                    self.notify_listeners()
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Command loop error")
             await asyncio.sleep(COMMAND_POLL_INTERVAL)

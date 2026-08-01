@@ -29,15 +29,15 @@ smoke-matter:
 ha-test:
     {{python}} -m pytest custom_components/thatsmatter/tests -q
 
-# Home Assistant / Python lint (placeholder until ruff/mypy are wired)
+# Home Assistant / Python lint
 ha-lint:
-    @echo "ha-lint: not configured yet (add ruff/mypy when the component grows)"
+    {{python}} -m ruff check .
 
 # Cargo + Python unit tests
 test: bridge-test ha-test
 
 # Full local verify without a live HA instance
-verify: test smoke smoke-matter
+verify: test smoke smoke-matter ha-lint
 
 # Docker HA + Matter Server + bridge (Linux host network recommended)
 docker-up:

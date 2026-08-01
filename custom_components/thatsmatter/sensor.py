@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -29,11 +29,12 @@ async def async_setup_entry(
 
 
 class ThatsMatterBaseSensor(SensorEntity):
-    """Shared device info for bridge diagnostics."""
+    """Shared device info and runtime push wiring for bridge diagnostics."""
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_should_poll = True
+    # Runtime pushes updates; polling only added latency to bridge transitions.
+    _attr_should_poll = False
 
     def __init__(self, runtime: ThatsMatterRuntime, entry: ConfigEntry) -> None:
         self._runtime = runtime
@@ -44,6 +45,18 @@ class ThatsMatterBaseSensor(SensorEntity):
             manufacturer="ThatsMatter",
             model="Matter bridge",
         )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._runtime.add_listener(self._handle_runtime_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._runtime.remove_listener(self._handle_runtime_update)
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_runtime_update(self) -> None:
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
@@ -84,6 +97,7 @@ class ThatsMatterStatusSensor(ThatsMatterBaseSensor):
             "export_count": status.get("export_count"),
             "enabled_export_count": status.get("enabled_export_count"),
             "pairing_open": status.get("pairing_open"),
+            "commissioned_fabrics": status.get("commissioned_fabrics"),
             "error": status.get("error") or self._runtime.last_error,
             "local_export_count": len(self._runtime.store.list_exports()),
         }
@@ -104,6 +118,9 @@ class ThatsMatterPairingCodeSensor(ThatsMatterBaseSensor):
 
     @property
     def native_value(self) -> str | None:
+        # Only surface the code while the commissioning window is open.
+        if not self._runtime.pairing_window_open:
+            return None
         code = self._runtime.pairing.get("setup_code")
         return str(code) if code else None
 
@@ -111,10 +128,15 @@ class ThatsMatterPairingCodeSensor(ThatsMatterBaseSensor):
     def extra_state_attributes(self) -> dict:
         pairing = self._runtime.pairing
         return {
-            "qr_payload": pairing.get("qr_payload"),
+            "qr_payload": pairing.get("qr_payload")
+            if self._runtime.pairing_window_open
+            else None,
             "discriminator": pairing.get("discriminator"),
             # passcode is sensitive; omit from attributes in production UIs if needed.
-            "passcode": pairing.get("passcode"),
+            "passcode": pairing.get("passcode")
+            if self._runtime.pairing_window_open
+            else None,
+            "pairing_window_open": self._runtime.pairing_window_open,
         }
 
 

@@ -16,7 +16,7 @@ use uuid::Uuid;
 async fn test_app() -> (axum::Router, Arc<DevMatterBackend>, tempfile::TempDir) {
   let dir = tempfile::tempdir().unwrap();
   let catalog = CatalogStore::new(dir.path(), "ThatsMatter");
-  let backend = Arc::new(DevMatterBackend::new(dir.path()));
+  let backend = Arc::new(DevMatterBackend::new(dir.path()).unwrap());
   backend.start().await.unwrap();
   let state = Arc::new(AppState::new(catalog, backend.clone() as Arc<dyn MatterBackend>));
   (ipc::router(state), backend, dir)
@@ -62,6 +62,7 @@ async fn health_and_status() {
   assert_eq!(status["matter_backend"], "dev");
   assert_eq!(status["export_count"], 0);
   assert_eq!(status["pairing_open"], true);
+  assert_eq!(status["commissioned_fabrics"], 0);
 }
 
 #[tokio::test]
@@ -262,7 +263,7 @@ async fn state_push_and_command_queue() {
 }
 
 #[tokio::test]
-async fn pairing_returns_placeholders() {
+async fn pairing_returns_commissionable_material() {
   let (app, _, _dir) = test_app().await;
   let res = app
     .oneshot(
@@ -279,6 +280,97 @@ async fn pairing_returns_placeholders() {
   assert!(!p["qr_payload"].as_str().unwrap().is_empty());
   assert!(p["discriminator"].as_u64().is_some());
   assert!(p["passcode"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn pairing_window_open_close_and_clamp() {
+  let (app, backend, _dir) = test_app().await;
+
+  // Startup window is open (dev mirrors 900s no-fabric startup).
+  assert!(backend.pairing_open().await);
+  assert_eq!(backend.commissioned_fabrics().await, 0);
+
+  // Close
+  let res = app
+    .clone()
+    .oneshot(
+      axum::http::Request::builder()
+        .method("POST")
+        .uri("/pairing/close")
+        .body(axum::body::Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), 200);
+  let closed = body_json(res).await;
+  assert_eq!(closed["pairing_open"], false);
+  assert!(!backend.pairing_open().await);
+
+  let res = app
+    .clone()
+    .oneshot(
+      axum::http::Request::builder()
+        .uri("/status")
+        .body(axum::body::Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  let status = body_json(res).await;
+  assert_eq!(status["pairing_open"], false);
+  assert_eq!(status["commissioned_fabrics"], 0);
+
+  // Open with empty body -> default 300
+  let res = app
+    .clone()
+    .oneshot(
+      axum::http::Request::builder()
+        .method("POST")
+        .uri("/pairing/open")
+        .body(axum::body::Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), 200);
+  let opened = body_json(res).await;
+  assert_eq!(opened["pairing_open"], true);
+  assert_eq!(opened["timeout_secs"], 300);
+  assert!(backend.pairing_open().await);
+
+  // Below-min timeout is clamped to 180
+  let res = app
+    .clone()
+    .oneshot(
+      axum::http::Request::builder()
+        .method("POST")
+        .uri("/pairing/open")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"timeout_secs":60}"#))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), 200);
+  let clamped = body_json(res).await;
+  assert_eq!(clamped["pairing_open"], true);
+  assert_eq!(clamped["timeout_secs"], 180);
+  assert!(backend.pairing_open().await);
+
+  // Close again
+  let res = app
+    .oneshot(
+      axum::http::Request::builder()
+        .method("POST")
+        .uri("/pairing/close")
+        .body(axum::body::Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), 200);
+  assert!(!backend.pairing_open().await);
 }
 
 #[tokio::test]

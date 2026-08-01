@@ -20,7 +20,7 @@ async fn body_json(res: axum::response::Response) -> serde_json::Value {
 async fn ha_state_push_and_controller_command_roundtrip() {
   let dir = tempfile::tempdir().unwrap();
   let catalog = CatalogStore::new(dir.path(), "ThatsMatter");
-  let backend = Arc::new(DevMatterBackend::new(dir.path()));
+  let backend = Arc::new(DevMatterBackend::new(dir.path()).unwrap());
   backend.start().await.unwrap();
   let state = Arc::new(AppState::new(catalog, backend.clone() as Arc<dyn MatterBackend>));
   let app = ipc::router(state);
