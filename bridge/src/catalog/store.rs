@@ -121,13 +121,21 @@ impl CatalogStore {
     if exports_path.exists() {
       let raw = std::fs::read_to_string(&exports_path)?;
       let file: PersistedExports = serde_json::from_str(&raw)?;
-      for mut exp in file.exports {
-        if exp.endpoint_id.is_none() {
-          exp.endpoint_id = Some(store.alloc_endpoint()?);
-        } else if let Some(ep) = exp.endpoint_id {
+      // Insert persisted endpoint ids first so later allocation cannot collide with them.
+      let mut missing: Vec<Uuid> = Vec::new();
+      for exp in file.exports {
+        if let Some(ep) = exp.endpoint_id {
           store.next_endpoint = store.next_endpoint.max(ep.saturating_add(1));
+        } else {
+          missing.push(exp.export_id);
         }
         store.by_id.insert(exp.export_id, exp);
+      }
+      for id in missing {
+        let ep = store.alloc_endpoint()?;
+        if let Some(exp) = store.by_id.get_mut(&id) {
+          exp.endpoint_id = Some(ep);
+        }
       }
     }
 

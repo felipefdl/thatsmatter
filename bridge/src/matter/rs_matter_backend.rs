@@ -302,7 +302,7 @@ impl MatterBackend for RsMatterBackend {
         export_id = %primary.export_id,
         name = %primary.name,
         endpoint_id = ?primary.endpoint_id,
-        "Bound OnOff export bound to Matter endpoint {LIGHT_ENDPOINT_ID}"
+        "OnOff export bound to Matter endpoint {LIGHT_ENDPOINT_ID}"
       );
     } else {
       *self.shared.export_id.lock() = None;
