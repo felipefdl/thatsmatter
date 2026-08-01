@@ -73,12 +73,6 @@ echo
 curl -sf "${BASE}/pairing" | tee "${OUT_DIR}/pairing.json"
 echo
 
-python3 - <<'PY'
-import json, os, sys
-out = os.environ.get("SMOKE_OUT_DIR") or os.environ.get("DATA_DIR")
-# paths relative via argv from shell
-PY
-
 python3 -c '
 import json, sys
 status = json.load(open(sys.argv[1]))
