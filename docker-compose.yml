@@ -4,7 +4,7 @@
 #   docker compose up --build
 #
 # Then open HA at http://localhost:8123, install ThatsMatter (pre-mounted),
-# configure bridge host `thatsmatter-bridge` port 18465, add an export for a
+# configure bridge host `127.0.0.1` port 18465 (host networking), add an export for a
 # demo light, and commission the bridge into the Matter integration using
 # the setup code from the ThatsMatter pairing sensor (or GET /pairing).
 #
@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
 
   matter-server:
-    image: ghcr.io/matter-js/python-matter-server:stable
+    image: ghcr.io/home-assistant-libs/python-matter-server:stable
     container_name: thatsmatter-matter-server
     # Official Matter Server needs host network for commissioning discovery.
     network_mode: host
