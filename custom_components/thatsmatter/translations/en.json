@@ -90,7 +90,8 @@
     },
     "error": {
       "add_failed": "Could not add one or more devices. Check the description.",
-      "update_failed": "Could not update that export."
+      "update_failed": "Could not update that export.",
+      "pairing_unavailable": "Could not open the pairing window. Check that the ThatsMatter bridge is running, then try again. Setup code and QR are withheld until the window is open."
     },
     "abort": {
       "not_configured": "ThatsMatter is not loaded."

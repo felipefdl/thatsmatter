@@ -20,7 +20,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .bridge_client import BridgeClient, BridgeClientError
 from .const import COMMAND_POLL_INTERVAL, DOMAIN, STATUS_POLL_INTERVAL
-from .helpers import ha_state_value, matter_level_to_ha_brightness
+from .helpers import (
+    ha_state_value,
+    matter_level_to_ha_brightness,
+    should_show_pairing_notification,
+)
 from .models import Export
 from .store import ExportStore
 
@@ -139,14 +143,28 @@ class ThatsMatterRuntime:
         await self.async_show_pairing_notification()
         self.notify_listeners()
 
+    async def async_dismiss_pairing_notification(self) -> None:
+        """Remove the pairing drawer entry and allow a later re-notify of the same code."""
+        self._last_notified_code = None
+        from homeassistant.components.persistent_notification import (
+            async_dismiss as async_dismiss_notification,
+        )
+
+        async_dismiss_notification(self.hass, self._pairing_notice_id)
+
     async def async_show_pairing_notification(self) -> None:
-        """Surface pairing code in the HA notification drawer while the window is open."""
-        if not self.pairing_window_open:
-            # Allow a later re-open of the same code to notify again.
-            self._last_notified_code = None
-            return
+        """Surface pairing code in the HA notification drawer while the window is open.
+
+        Dismisses the notification when the window is closed, the bridge is
+        disconnected, or pairing material is unavailable.
+        """
         code = self.pairing.get("setup_code")
-        if not code:
+        if not should_show_pairing_notification(
+            bridge_connected=self.bridge_connected,
+            pairing_open=self.pairing_window_open,
+            has_setup_code=bool(code),
+        ):
+            await self.async_dismiss_pairing_notification()
             return
         code_s = str(code)
         if code_s == self._last_notified_code:
@@ -191,6 +209,7 @@ class ThatsMatterRuntime:
                     pass
         self._command_task = None
         self._status_task = None
+        await self.async_dismiss_pairing_notification()
 
     def _require_client(self) -> BridgeClient:
         if self.client is None:

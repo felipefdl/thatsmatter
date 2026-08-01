@@ -501,13 +501,55 @@ impl ExportPlane {
     }
   }
 
+  /// Record the current fabric count as the sampling baseline without clearing the
+  /// window. Used before storing a fresh open deadline so a later `apply_fabric_sample`
+  /// cannot treat the open as stale (`count > prev` with an outdated `prev`).
+  fn establish_fabric_baseline(&self, count: u8) {
+    self.fabric_count.store(count, Ordering::SeqCst);
+  }
+
+  /// Apply a fabric-count sample: update the baseline, clear the window when a new
+  /// fabric appears, and lazily expire an overdue deadline.
+  fn apply_fabric_sample(&self, count: u8) {
+    let prev = self.fabric_count.swap(count, Ordering::SeqCst);
+    if count > prev {
+      // Commissioning completed (or another fabric was added): window is done.
+      self.window_deadline.store(0, Ordering::SeqCst);
+      tracing::info!(fabrics = count, "fabric count increased; pairing window closed");
+    }
+    // Lazy expiry: pairing_open() already compares now < deadline, but clear the
+    // atomic so status stays honest without a clock on every poll.
+    let deadline = self.window_deadline.load(Ordering::SeqCst);
+    if deadline != 0 && epoch_secs() >= deadline {
+      self.window_deadline.store(0, Ordering::SeqCst);
+      tracing::info!("pairing window expired");
+    }
+  }
+
+  /// Mark the bridge-tracked window closed (deadline 0).
+  fn mark_window_closed(&self) {
+    self.window_deadline.store(0, Ordering::SeqCst);
+  }
+
+  /// Mark a successfully opened window: re-establish fabric baseline, then store the
+  /// new deadline. Ordering matters so a fabric sample in the same loop iteration
+  /// cannot wipe this open via a stale `prev`.
+  fn mark_window_opened(&self, timeout_secs: u16, fabric_count: u8) {
+    self.establish_fabric_baseline(fabric_count);
+    let deadline = epoch_secs().saturating_add(u64::from(timeout_secs));
+    self.window_deadline.store(deadline, Ordering::SeqCst);
+  }
+
   /// Ask the stack thread to open a basic commissioning window.
   pub fn request_open_window(&self, timeout_secs: u16) -> anyhow::Result<()> {
     let timeout = clamp_pairing_timeout(timeout_secs);
     self.post_window_request(WindowOp::Open(timeout))
   }
 
-  /// Ask the stack thread to close any open commissioning window.
+  /// Ask the stack thread to close any window this bridge opened.
+  ///
+  /// Idempotent when no bridge-tracked window is open (does not revoke
+  /// controller-opened ECM windows we never tracked).
   pub fn request_close_window(&self) -> anyhow::Result<()> {
     self.post_window_request(WindowOp::Close)
   }
@@ -1125,8 +1167,11 @@ impl AsyncHandler for ExportPlane {
         futures_lite::future::race(wake, tick).await;
       }
 
-      self.drain_window_request(&ctx);
+      // Sample fabrics first so a pending fabric increase updates the baseline
+      // (and closes any prior window) before we process a fresh open request.
+      // Open then re-baselines immediately before storing its deadline.
       self.sample_fabrics(&ctx);
+      self.drain_window_request(&ctx);
 
       // Drain every outstanding config generation. Acknowledge only the generation
       // observed before the bump: if `set_exports` advanced the counter while we
@@ -1176,54 +1221,72 @@ impl ExportPlane {
     };
     let result = match req.op {
       WindowOp::Open(timeout_secs) => {
+        // Baseline fabrics before open so a same-iteration sample (or a count
+        // that already rose while we still held a stale prev) cannot wipe the
+        // new deadline via `count > prev`.
+        let count = Self::read_fabric_count(ctx);
+        self.establish_fabric_baseline(count);
+
         // rs-matter rejects open while a window is already open. Close first so
         // "Open pairing window" is idempotent for multi-admin re-pair.
-        let _ = ctx.matter().close_comm_window(ctx);
+        // On successful close, clear our deadline immediately: if the subsequent
+        // open fails we must stay closed (no stale pairing_open).
+        match ctx.matter().close_comm_window(ctx) {
+          Ok(_) => self.mark_window_closed(),
+          Err(err) => {
+            tracing::warn!(error = ?err, "pre-open close_comm_window failed; still attempting open");
+          }
+        }
+
         match ctx.matter().open_basic_comm_window(timeout_secs, ctx.crypto(), ctx) {
           Ok(()) => {
-            let deadline = epoch_secs().saturating_add(u64::from(timeout_secs));
-            self.window_deadline.store(deadline, Ordering::SeqCst);
+            let count = Self::read_fabric_count(ctx);
+            self.mark_window_opened(timeout_secs, count);
             tracing::info!(timeout_secs, "basic commissioning window opened");
             Ok(())
           }
           Err(err) => {
+            // Pre-open close already cleared the deadline on success; keep closed.
             tracing::warn!(error = ?err, "open_basic_comm_window failed");
             Err(format!("open pairing window failed: {err:?}"))
           }
         }
       }
-      WindowOp::Close => match ctx.matter().close_comm_window(ctx) {
-        Ok(was_open) => {
-          self.window_deadline.store(0, Ordering::SeqCst);
-          tracing::info!(was_open, "commissioning window closed");
+      WindowOp::Close => {
+        // Close only windows this bridge opened. If we do not track an open
+        // deadline, stay idempotent and do not call close_comm_window — that
+        // would revoke a controller-opened ECM window we never tracked.
+        if !self.pairing_open() {
+          self.mark_window_closed();
+          tracing::debug!("close pairing window: no bridge-tracked window; skip stack close");
           Ok(())
+        } else {
+          match ctx.matter().close_comm_window(ctx) {
+            Ok(was_open) => {
+              self.mark_window_closed();
+              tracing::info!(was_open, "commissioning window closed");
+              Ok(())
+            }
+            Err(err) => {
+              tracing::warn!(error = ?err, "close_comm_window failed");
+              Err(format!("close pairing window failed: {err:?}"))
+            }
+          }
         }
-        Err(err) => {
-          tracing::warn!(error = ?err, "close_comm_window failed");
-          Err(format!("close pairing window failed: {err:?}"))
-        }
-      },
+      }
     };
     let _ = req.reply.send(result);
   }
 
-  /// Snapshot fabric count; clear our window when a new fabric appears.
+  /// Snapshot fabric count from the live stack; clear our window when a new fabric appears.
   fn sample_fabrics(&self, ctx: &impl HandlerContext) {
+    let count = Self::read_fabric_count(ctx);
+    self.apply_fabric_sample(count);
+  }
+
+  fn read_fabric_count(ctx: &impl HandlerContext) -> u8 {
     let count = ctx.matter().with_state(|state| state.fabrics.iter().count());
-    let count = u8::try_from(count).unwrap_or(u8::MAX);
-    let prev = self.fabric_count.swap(count, Ordering::SeqCst);
-    if count > prev {
-      // Commissioning completed (or another fabric was added): window is done.
-      self.window_deadline.store(0, Ordering::SeqCst);
-      tracing::info!(fabrics = count, "fabric count increased; pairing window closed");
-    }
-    // Lazy expiry: pairing_open() already compares now < deadline, but clear the
-    // atomic so status stays honest without a clock on every poll.
-    let deadline = self.window_deadline.load(Ordering::SeqCst);
-    if deadline != 0 && epoch_secs() >= deadline {
-      self.window_deadline.store(0, Ordering::SeqCst);
-      tracing::info!("pairing window expired");
-    }
+    u8::try_from(count).unwrap_or(u8::MAX)
   }
 }
 
@@ -2461,5 +2524,106 @@ mod tests {
         .load(Ordering::SeqCst),
       desc_before
     );
+  }
+
+  /// Same-iteration fabric-increase + open must not wipe a fresh window: establish
+  /// baseline before storing the new deadline (and sample-before-open in the run loop).
+  #[test]
+  fn fabric_increase_then_open_keeps_new_deadline() {
+    let plane = ExportPlane::new();
+    // Startup: no fabrics, window open.
+    plane.note_startup_commissioning_state(0);
+    assert!(plane.pairing_open());
+    assert_eq!(plane.commissioned_fabrics(), 0);
+
+    // Pending fabric increase (commissioning completed) would clear the old window.
+    plane.apply_fabric_sample(1);
+    assert!(!plane.pairing_open());
+    assert_eq!(plane.commissioned_fabrics(), 1);
+
+    // Multi-admin re-open: baseline at current fabric count, then store deadline.
+    // A subsequent sample with the same count must not clear the window.
+    plane.mark_window_opened(300, 1);
+    assert!(plane.pairing_open());
+    plane.apply_fabric_sample(1);
+    assert!(
+      plane.pairing_open(),
+      "same fabric count after open must not clear the new deadline"
+    );
+    assert_eq!(plane.commissioned_fabrics(), 1);
+  }
+
+  /// Regression: opening without re-baselining leaves a stale prev; next sample wipes
+  /// the fresh open. Documents why mark_window_opened stores fabric_count first.
+  #[test]
+  fn fabric_increase_open_race_without_baseline_would_wipe() {
+    let plane = ExportPlane::new();
+    plane.note_startup_commissioning_state(0);
+    assert_eq!(plane.commissioned_fabrics(), 0);
+
+    // Simulate buggy path: store deadline without updating fabric baseline.
+    let deadline = epoch_secs().saturating_add(300);
+    plane.window_deadline.store(deadline, Ordering::SeqCst);
+    assert!(plane.pairing_open());
+
+    // Fabric count already rose (commissioning done) but prev is still 0.
+    plane.apply_fabric_sample(1);
+    assert!(
+      !plane.pairing_open(),
+      "stale prev makes count>prev wipe a deadline set without re-baseline"
+    );
+
+    // Correct path: re-baseline before deadline so the same sample is a no-op.
+    plane.mark_window_opened(300, 1);
+    assert!(plane.pairing_open());
+    plane.apply_fabric_sample(1);
+    assert!(plane.pairing_open());
+  }
+
+  /// Close-then-open failure: after successful pre-open close the deadline is cleared,
+  /// so a failed open leaves pairing_open false (no stale open status).
+  #[test]
+  fn close_success_open_failure_leaves_window_closed() {
+    let plane = ExportPlane::new();
+    plane.note_startup_commissioning_state(0);
+    assert!(plane.pairing_open());
+
+    // Pre-open close succeeded → clear deadline before attempting open.
+    plane.mark_window_closed();
+    assert!(!plane.pairing_open());
+
+    // Open fails: we must not restore a deadline. Stay closed.
+    assert!(!plane.pairing_open());
+    assert_eq!(plane.window_deadline.load(Ordering::SeqCst), 0);
+  }
+
+  /// Close is idempotent when we do not track an open window (do not imply a stack close).
+  #[test]
+  fn close_untracked_window_is_idempotent_without_stack() {
+    let plane = ExportPlane::new();
+    // Fabrics present at startup → no bridge-tracked window.
+    plane.note_startup_commissioning_state(1);
+    assert!(!plane.pairing_open());
+
+    // Gating decision used by drain_window_request: skip close_comm_window.
+    assert!(
+      !plane.pairing_open(),
+      "no bridge-tracked window → close must not call the stack"
+    );
+    plane.mark_window_closed();
+    assert!(!plane.pairing_open());
+    assert_eq!(plane.commissioned_fabrics(), 1);
+  }
+
+  #[test]
+  fn fabric_increase_clears_open_window() {
+    let plane = ExportPlane::new();
+    plane.note_startup_commissioning_state(0);
+    assert!(plane.pairing_open());
+    plane.apply_fabric_sample(1);
+    assert!(!plane.pairing_open());
+    // Further samples at the same count stay closed.
+    plane.apply_fabric_sample(1);
+    assert!(!plane.pairing_open());
   }
 }

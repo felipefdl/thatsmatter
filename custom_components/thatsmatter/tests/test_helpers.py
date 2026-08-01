@@ -20,6 +20,8 @@ from custom_components.thatsmatter.helpers import (  # noqa: E402
     ha_brightness_to_matter_level,
     is_supported_type,
     matter_level_to_ha_brightness,
+    pairing_credentials_for_display,
+    should_show_pairing_notification,
     validate_export_fields,
 )
 
@@ -127,3 +129,76 @@ def test_brightness_round_trip_edges() -> None:
     assert matter_level_to_ha_brightness(254) == 255
     mid = ha_brightness_to_matter_level(128)
     assert 0 < mid < 254
+
+
+def test_pairing_credentials_withheld_when_open_fails() -> None:
+    """Options flow must not display setup code/QR unless open succeeded and status is open."""
+    material = {"setup_code": "1234-567-8901", "qr_payload": "MT:ABC"}
+    assert (
+        pairing_credentials_for_display(
+            open_ok=False,
+            pairing_open=False,
+            pairing=material,
+        )
+        is None
+    )
+    # Open call returned success but status still reports closed.
+    assert (
+        pairing_credentials_for_display(
+            open_ok=True,
+            pairing_open=False,
+            pairing=material,
+        )
+        is None
+    )
+    # Open failed even if a stale pairing_open flag were true.
+    assert (
+        pairing_credentials_for_display(
+            open_ok=False,
+            pairing_open=True,
+            pairing=material,
+        )
+        is None
+    )
+
+
+def test_pairing_credentials_shown_only_when_open_and_confirmed() -> None:
+    material = {"setup_code": "1234-567-8901", "qr_payload": "MT:ABC"}
+    assert pairing_credentials_for_display(
+        open_ok=True,
+        pairing_open=True,
+        pairing=material,
+    ) == ("1234-567-8901", "MT:ABC")
+    # Missing material still withholds.
+    assert (
+        pairing_credentials_for_display(
+            open_ok=True,
+            pairing_open=True,
+            pairing={},
+        )
+        is None
+    )
+
+
+def test_should_show_pairing_notification_gating() -> None:
+    """Notification stays only while connected + window open + code present; else dismiss."""
+    assert should_show_pairing_notification(
+        bridge_connected=True,
+        pairing_open=True,
+        has_setup_code=True,
+    )
+    assert not should_show_pairing_notification(
+        bridge_connected=False,
+        pairing_open=True,
+        has_setup_code=True,
+    )
+    assert not should_show_pairing_notification(
+        bridge_connected=True,
+        pairing_open=False,
+        has_setup_code=True,
+    )
+    assert not should_show_pairing_notification(
+        bridge_connected=True,
+        pairing_open=True,
+        has_setup_code=False,
+    )

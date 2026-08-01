@@ -41,7 +41,7 @@ from .export_manager import (
     get_runtime,
     type_options,
 )
-from .helpers import SUPPORTED_DOMAINS
+from .helpers import SUPPORTED_DOMAINS, pairing_credentials_for_display
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate bridge host/port/name and return entry fields."""
@@ -207,28 +207,42 @@ class ThatsMatterOptionsFlow(config_entries.OptionsFlow):
     async def async_step_pairing(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Open the pairing window, then show setup code and QR guidance."""
+        """Open the pairing window, then show setup code and QR guidance.
+
+        Credentials are only shown when open succeeded and status confirms
+        ``pairing_open``. On failure the form shows an error and withholds codes.
+        """
         if user_input is not None:
             return await self.async_step_init()
 
-        code = "—"
-        qr = "—"
+        errors: dict[str, str] = {}
+        code = "unavailable"
+        qr = "unavailable"
         try:
             runtime = get_runtime(self.hass)
-            # Ensure the shown code is usable for multi-admin pairing.
+            open_ok = False
             try:
                 await runtime.async_open_pairing_window()
+                open_ok = True
             except BridgeClientError:
-                # Bridge offline or open failed; still try last-known material.
-                await runtime.async_refresh_pairing()
-            code = str(runtime.pairing.get("setup_code") or "—")
-            qr = str(runtime.pairing.get("qr_payload") or "—")
+                open_ok = False
+
+            displayed = pairing_credentials_for_display(
+                open_ok=open_ok,
+                pairing_open=runtime.pairing_window_open,
+                pairing=runtime.pairing,
+            )
+            if displayed is None:
+                errors["base"] = "pairing_unavailable"
+            else:
+                code, qr = displayed
         except HomeAssistantError:
-            pass
+            errors["base"] = "pairing_unavailable"
 
         return self.async_show_form(
             step_id="pairing",
             data_schema=vol.Schema({}),
+            errors=errors,
             description_placeholders={
                 "setup_code": code,
                 "qr_payload": qr,
