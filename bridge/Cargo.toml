@@ -26,10 +26,16 @@ futures-lite = "2"
 parking_lot = "0.12"
 rand = "0.8"
 rs-matter = { version = "0.2", default-features = false, features = ["os", "log", "zeroconf", "rustcrypto"] }
-rs-matter-stack = { version = "0.1", default-features = false, features = ["os", "log", "zeroconf", "rustcrypto"] }
+# `max-subscriptions-8`: the default of 3 is exhausted by HA + a second ecosystem + a debug tool.
+rs-matter-stack = { version = "0.1", default-features = false, features = [
+  "os",
+  "log",
+  "zeroconf",
+  "rustcrypto",
+  "max-subscriptions-8",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-static_cell = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }

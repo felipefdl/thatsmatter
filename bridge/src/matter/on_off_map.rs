@@ -43,13 +43,6 @@ pub fn is_matter_on_off_export(export: &Export) -> bool {
   export.enabled && export.type_.is_on_off_capable()
 }
 
-/// Pick the primary OnOff export from a catalog (stable: lowest endpoint_id, then name).
-pub fn primary_on_off_export(exports: &[Export]) -> Option<&Export> {
-  let mut candidates: Vec<&Export> = exports.iter().filter(|e| is_matter_on_off_export(e)).collect();
-  candidates.sort_by_key(|e| (e.endpoint_id.unwrap_or(u16::MAX), e.name.as_str()));
-  candidates.into_iter().next()
-}
-
 /// HA domain service suggestion for an OnOff command (pure; no HA import).
 pub fn ha_service_for_on_off(entity_id: &str, on: bool) -> (&'static str, &'static str) {
   let domain = entity_id.split('.').next().unwrap_or("switch");
@@ -143,18 +136,13 @@ mod tests {
   }
 
   #[test]
-  fn primary_export_picks_lowest_endpoint() {
-    let a = exp(Uuid::new_v4(), "light.a", DeviceType::Light, true, Some(2));
-    let b = exp(Uuid::new_v4(), "switch.b", DeviceType::OnOffSwitch, true, Some(1));
-    let list = [a.clone(), b.clone()];
-    let p = primary_on_off_export(&list).unwrap();
-    assert_eq!(p.export_id, b.export_id);
-  }
-
-  #[test]
-  fn disabled_exports_skipped() {
-    let a = exp(Uuid::new_v4(), "light.a", DeviceType::Light, false, Some(1));
-    assert!(primary_on_off_export(&[a]).is_none());
+  fn only_enabled_on_off_capable_exports_are_bridged() {
+    let enabled = exp(Uuid::new_v4(), "switch.b", DeviceType::OnOffSwitch, true, Some(1));
+    let disabled = exp(Uuid::new_v4(), "light.a", DeviceType::Light, false, Some(2));
+    let sensor = exp(Uuid::new_v4(), "binary_sensor.c", DeviceType::Contact, true, Some(3));
+    assert!(is_matter_on_off_export(&enabled));
+    assert!(!is_matter_on_off_export(&disabled));
+    assert!(!is_matter_on_off_export(&sensor));
   }
 
   #[test]
