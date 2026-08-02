@@ -7,6 +7,7 @@ mod dev;
 mod device_types;
 mod export_plane;
 mod lan_netif;
+mod net_stack;
 mod on_off_map;
 pub(crate) mod pairing;
 mod rs_matter_backend;

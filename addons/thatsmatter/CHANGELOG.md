@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Builtin mDNS binds UDP 5353 with SO_REUSEADDR/SO_REUSEPORT so it can share the port with Home Assistant Core (was Address already in use)
+- Increase Matter stack bump arena to avoid panic after mDNS bind retries
+
 ## 0.2.3
 
 - When host Avahi is missing (typical HAOS), use built-in mDNS (UDP 5353) instead of Zeroconf, which cannot advertise without Avahi

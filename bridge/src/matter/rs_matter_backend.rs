@@ -217,7 +217,9 @@ fn run_matter_stack(
   use rs_matter_stack::matter::utils::init::InitMaybeUninit;
   use rs_matter_stack::matter::utils::zbus::Connection;
 
-  const BUMP_SIZE: usize = 23500;
+  // BuiltinMdns + multi-responder IM needs more arena than the default eth OnOff
+  // example. 23_500 exhausted after mDNS bind retries (panic: Out of bump memory).
+  const BUMP_SIZE: usize = 98_304;
 
   // Set true only after ready_tx Ok is sent (visible after the closure returns).
   let ready_sent = AtomicBool::new(false);
@@ -306,11 +308,15 @@ fn run_matter_stack(
     let _ = ready_tx.send(Ok(()));
     ready_sent.store(true, Ordering::SeqCst);
 
+    // SO_REUSEPORT UDP binds so BuiltinMdns can share host 5353 with HA Core / others
+    // (same pattern as rs-matter integration tests and Matterbridge).
+    let net = super::net_stack::MatterNetStack::new();
+
     match mdns_choice {
       MdnsChoice::Avahi(conn) => {
         tracing::info!("mDNS: active backend = Avahi (system D-Bus)");
         let matter = core::pin::pin!(stack.run_preex(
-          edge_nal_std::Stack::new(),
+          net,
           LanNetifs::new(mdns_interface),
           AvahiMdnsService {
             inner: AvahiMdns::new(conn),
@@ -323,9 +329,9 @@ fn run_matter_stack(
         futures_lite::future::block_on(matter).map_err(|e| format!("run: {e:?}"))
       }
       MdnsChoice::Builtin => {
-        tracing::info!("mDNS: active backend = BuiltinMdns (self-contained UDP 5353)");
+        tracing::info!("mDNS: active backend = BuiltinMdns (UDP 5353 with SO_REUSEADDR/SO_REUSEPORT)");
         let matter = core::pin::pin!(stack.run_preex(
-          edge_nal_std::Stack::new(),
+          net,
           LanNetifs::new(mdns_interface),
           BuiltinMdns::new(),
           &crypto,
