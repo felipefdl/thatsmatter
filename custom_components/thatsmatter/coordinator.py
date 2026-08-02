@@ -343,6 +343,10 @@ class ThatsMatterRuntime:
                         # usually the first to observe a reconnect.
                         await self._async_on_reconnected()
                         self.notify_listeners()
+                    if commands:
+                        _LOGGER.info(
+                            "Drained %s Matter command(s) from bridge", len(commands)
+                        )
                     for cmd in commands:
                         await self._async_execute_command(cmd)
             except asyncio.CancelledError:
@@ -393,7 +397,15 @@ class ThatsMatterRuntime:
         kind = cmd.get("kind")
         export = self.store.get(export_id)
         if export is None or not export.enabled:
-            _LOGGER.debug("Ignoring command for missing/disabled export %s", export_id)
+            known = [e.export_id for e in self.store.list_exports()]
+            _LOGGER.warning(
+                "Ignoring Matter command kind=%s export_id=%s (missing/disabled). "
+                "Known exports: %s. raw=%s",
+                kind,
+                export_id,
+                known,
+                cmd,
+            )
             return
 
         entity_id = export.primary_entity_id
@@ -407,6 +419,14 @@ class ThatsMatterRuntime:
                     service = SERVICE_OPEN_COVER if on else SERVICE_CLOSE_COVER
                 else:
                     service = SERVICE_TURN_ON if on else SERVICE_TURN_OFF
+                _LOGGER.info(
+                    "Matter → HA %s.%s entity_id=%s export_id=%s on=%s",
+                    domain,
+                    service,
+                    entity_id,
+                    export_id,
+                    on,
+                )
                 await self.hass.services.async_call(
                     domain, service, data, blocking=True
                 )

@@ -243,6 +243,12 @@ pub async fn push_state(State(state): State<SharedState>, Path(id): Path<Uuid>, 
 /// `GET /commands` — poll and drain pending Matter → HA commands.
 pub async fn take_commands(State(state): State<SharedState>) -> Json<PendingCommands> {
   let commands = state.backend.take_commands().await;
+  if !commands.is_empty() {
+    tracing::info!(
+      count = commands.len(),
+      "draining Matter→HA command queue for HA poll"
+    );
+  }
   Json(PendingCommands { commands })
 }
 
